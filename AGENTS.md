@@ -154,6 +154,17 @@ limiter Worker and declare the binding in their own config.
 
 `src/core/`, `src/do/` and `src/client/` are written and at 100% coverage.
 
+[test/integration.test.ts](test/integration.test.ts) runs the two halves
+together inside workerd — the real client resolving the real binding — and pins
+the properties neither half can demonstrate alone: the closure running in the
+caller's isolate, a megabyte staying caller-side, peak overlap under the
+concurrency cap, one caller's 429 delaying another that never saw it, a
+body-encoded rate limit pausing the shared bucket where a body-encoded error
+does not, and a lost wait queue rejecting rather than hanging. The unit suites
+stay where they are; this one is about the pair. Timing note: `maxDelayInMs`
+clamps a `Retry-After` as well as the backoff, so a low ceiling makes penalties
+expire before an assertion can see them.
+
 The failure contract is closed in both halves. The layering it settled is worth
 keeping: **`src/core/scheduler.ts` knows nothing about `CallReport`**. The core
 speaks `ResultVerdict` — `{ isRateLimited, failed, retryable, message }` — and
