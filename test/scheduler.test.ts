@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { TokenBucket } from '../src/core/bucket.js';
 import {
+  CallFailedError,
   DEFAULT_CONCURRENCY,
   Scheduler,
   createStatusClassifier,
@@ -9,6 +10,8 @@ import {
   exponentialBackoff,
   readRetryAfterMs,
   type Bucket,
+  type ResultClassifier,
+  type ResultVerdict,
   type RetryOptions,
 } from '../src/core/scheduler.js';
 
@@ -454,6 +457,171 @@ describe('retry and classification', () => {
       scheduler.call(() => Promise.reject(new Error('x')))
     ).rejects.toThrow('x');
     expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe('failed verdicts', () => {
+  /**
+   * A plain classifier stub, not an envelope: the core knows nothing about
+   * `CallReport` and these tests are the guarantee that it stays that way.
+   */
+  function verdictClassifier(
+    verdict: ResultVerdict
+  ): ResultClassifier<unknown> {
+    return {
+      classifyResult: () => verdict,
+      classifyError: () => ({}),
+    };
+  }
+
+  it('rejects immediately on a non-retryable failure, after exactly one attempt', async () => {
+    // The regression this whole contract exists for: without `failed`, this
+    // resolves with the result as though it had succeeded.
+    const bucket = openBucket();
+    const scheduler = new Scheduler<unknown>({
+      bucket,
+      retry: { ...FAST_RETRY, maxRetries: 3 },
+      classify: verdictClassifier({
+        failed: true,
+        retryable: false,
+        message: 'not found',
+      }),
+    });
+
+    let attempts = 0;
+    await expect(
+      scheduler.call(() => {
+        attempts++;
+        return Promise.resolve({ status: 404 });
+      })
+    ).rejects.toThrow(CallFailedError);
+
+    expect(attempts).toBe(1);
+    expect(bucket.pauses).toEqual([]);
+  });
+
+  it('puts the status in the message, because RPC strips the property', async () => {
+    const scheduler = new Scheduler<unknown>({
+      bucket: openBucket(),
+      retry: { maxRetries: 0 },
+      classify: verdictClassifier({
+        failed: true,
+        retryable: false,
+        message: 'not found',
+      }),
+    });
+
+    const error = await scheduler
+      .call(() => Promise.resolve({ status: 404 }))
+      .catch((thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(CallFailedError);
+    expect((error as CallFailedError).status).toBe(404);
+    expect((error as CallFailedError).message).toBe('not found (status 404)');
+    expect((error as CallFailedError).name).toBe('CallFailedError');
+  });
+
+  it('retries a retryable failure to the limit, then rejects', async () => {
+    const bucket = openBucket();
+    const scheduler = new Scheduler<unknown>({
+      bucket,
+      retry: { ...FAST_RETRY, maxRetries: 2 },
+      classify: verdictClassifier({
+        failed: true,
+        retryable: true,
+        message: 'upstream is unwell',
+      }),
+    });
+
+    let attempts = 0;
+    await expect(
+      scheduler.call(() => {
+        attempts++;
+        return Promise.resolve({ status: 503 });
+      })
+    ).rejects.toThrow('upstream is unwell (status 503)');
+
+    expect(attempts).toBe(3);
+    // A failure that is not a rate limit is this call's problem alone.
+    expect(bucket.pauses).toEqual([]);
+  });
+
+  it('treats a failure that is also rate-limited as a rate limit first', async () => {
+    const bucket = openBucket();
+    const scheduler = new Scheduler<unknown>({
+      bucket,
+      retry: { ...FAST_RETRY, maxRetries: 1 },
+      classify: verdictClassifier({
+        isRateLimited: true,
+        failed: true,
+        // Non-retryable, and retried anyway: a 429 is a rate limit before it
+        // is anything else, so it pauses and tries again.
+        retryable: false,
+        message: 'slow down',
+      }),
+    });
+
+    let attempts = 0;
+    await expect(
+      scheduler.call(() => {
+        attempts++;
+        return Promise.resolve({ status: 429 });
+      })
+    ).rejects.toThrow('slow down');
+
+    expect(attempts).toBe(2);
+    expect(bucket.pauses).toEqual([1]);
+  });
+
+  it('returns the result unchanged when the verdict does not say failed', async () => {
+    const scheduler = new Scheduler<unknown>({
+      bucket: openBucket(),
+      retry: { ...FAST_RETRY, maxRetries: 1 },
+      classify: verdictClassifier({ failed: false, message: 'ignored' }),
+    });
+
+    await expect(
+      scheduler.call(() => Promise.resolve({ status: 200 }))
+    ).resolves.toEqual({ status: 200 });
+  });
+
+  it('still rejects usefully when the verdict carries no message', async () => {
+    const scheduler = new Scheduler<unknown>({
+      bucket: openBucket(),
+      retry: { maxRetries: 0 },
+      classify: verdictClassifier({ failed: true }),
+    });
+
+    // No message, and no status to append either.
+    await expect(scheduler.call(() => Promise.resolve('bare'))).rejects.toThrow(
+      'the call failed'
+    );
+  });
+
+  it('surfaces a later throw rather than an earlier failed verdict', async () => {
+    // `failure` must not outlive the attempt that produced it: the throw is
+    // the more recent, and therefore the more honest, outcome.
+    const scheduler = new Scheduler<unknown>({
+      bucket: openBucket(),
+      retry: { ...FAST_RETRY, maxRetries: 1 },
+      classify: {
+        classifyResult: () => ({
+          failed: true,
+          retryable: true,
+          message: 'first',
+        }),
+        classifyError: () => ({}),
+      },
+    });
+
+    let attempts = 0;
+    await expect(
+      scheduler.call(() => {
+        attempts++;
+        if (attempts === 1) return Promise.resolve({ status: 500 });
+        return Promise.reject(new Error('then it broke'));
+      })
+    ).rejects.toThrow('then it broke');
   });
 });
 

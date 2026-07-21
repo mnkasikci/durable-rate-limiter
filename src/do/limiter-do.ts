@@ -11,6 +11,7 @@ import {
   type BucketOptions,
   type BucketState,
   type CallReport,
+  type ResultClassifier,
   type RetryContext,
   type RetryOptions,
 } from '../core/index.js';
@@ -101,23 +102,30 @@ interface Runtime {
 }
 
 /**
- * Reads the envelope's raw `Retry-After` value.
+ * Reads the envelope's explicit delay: `retryAfterMs` first, then the raw
+ * `Retry-After` value.
  *
- * `readRetryAfterMs` already handles both seconds and HTTP-date, and is
- * already tested; feeding it a one-header carrier reuses that rather than
+ * `readRetryAfterMs` already prefers a number over a header and handles both
+ * seconds and HTTP-date, and is already tested; handing it a carrier shaped
+ * the way it expects reuses that precedence rather than restating it here and
  * growing a second date parser that will drift from the first.
  */
 function envelopeRetryAfterMs(
   report: CallReport<unknown> | undefined,
   now: number
 ): number | undefined {
-  const raw = report?.retryAfter;
-  if (typeof raw !== 'string') return undefined;
-  return readRetryAfterMs({ headers: { 'Retry-After': raw } }, now);
+  if (report === undefined) return undefined;
+  return readRetryAfterMs(
+    {
+      retryAfterMs: report.retryAfterMs,
+      headers: { 'Retry-After': report.retryAfter },
+    },
+    now
+  );
 }
 
 /**
- * `Retry-After` off the envelope when it parses, the standard policy
+ * The envelope's own delay when it carries one, the standard policy
  * otherwise.
  *
  * Pure, and it must stay pure: the scheduler also calls this on the plain
@@ -137,6 +145,37 @@ export function envelopeRetryDelay(
   return defaultRetryDelay(context);
 }
 
+/**
+ * Envelope → verdict. The one place `report.failure` is read.
+ *
+ * It lives here and not in the scheduler because the scheduler must not know
+ * what an envelope is: the core speaks `failed`/`retryable`/`message` and this
+ * maps the wire shape onto that vocabulary. Errors keep the default HTTP-ish
+ * treatment — a throw arrives stripped of every custom property, so there is
+ * nothing better to read on that side.
+ *
+ * `failure` and a 429 can arrive together; the scheduler resolves the
+ * precedence (rate limit first) so both are simply reported.
+ */
+export function createEnvelopeClassifier(): ResultClassifier<
+  CallReport<unknown>
+> {
+  const base = createStatusClassifier<CallReport<unknown>>();
+  return {
+    classifyResult: (report) => ({
+      isRateLimited: report.status === 429,
+      failed: report.failure !== undefined,
+      retryable: report.failure?.retryable ?? false,
+      // Spread rather than assigned: `exactOptionalPropertyTypes` treats an
+      // explicit `undefined` as a different thing from an absent key.
+      ...(report.failure === undefined
+        ? {}
+        : { message: report.failure.message }),
+    }),
+    classifyError: base.classifyError,
+  };
+}
+
 export class LimiterDO extends DurableObject implements LimiterRpc {
   /**
    * Memoised as a *promise*, not a value. Two concurrent `execute` calls that
@@ -148,6 +187,11 @@ export class LimiterDO extends DurableObject implements LimiterRpc {
   /**
    * Schedule `fn` against this limiter's shared limits and return whatever it
    * reported. `fn` runs in the CALLER's isolate — see the class docs.
+   *
+   * An envelope carrying `failure` does not resolve: a non-retryable one
+   * rejects at once, a retryable one after the retries are spent. The
+   * rejection is a `CallFailedError`, which crosses back stripped to its
+   * message — everything worth keeping is in there.
    *
    * `T` is inferred from the argument, which is the one form of generic that
    * survives an RPC stub: a type parameter chosen at the call site collapses
@@ -246,17 +290,13 @@ export class LimiterDO extends DurableObject implements LimiterRpc {
       bucket,
       concurrency: config.concurrency,
       retry: config.retry ?? {},
-      // The envelope carries `status` at the top level, exactly where the
-      // default classifier looks — so classification needs no knowledge of
-      // the upstream's error shape, and no bespoke classifier here.
-      //
-      // Only the *result* side of it does real work. Workers RPC reconstructs
-      // a thrown error from name/message/stack alone, so a `status` a caller
-      // attaches to an Error does not survive the hop and every throw looks
-      // transient from in here. That is why the envelope is the contract: a
-      // failure a caller wants treated as final must be *reported*, not
-      // thrown.
-      classify: createStatusClassifier<CallReport<unknown>>(),
+      // Workers RPC reconstructs a thrown error from name/message/stack
+      // alone, so a `status` or a `retryable` a caller attaches to an Error
+      // does not survive the hop and every throw looks transient from in
+      // here. That is why the envelope is the contract: a failure a caller
+      // wants treated as final must be *reported*, and this classifier is
+      // where the report is read.
+      classify: createEnvelopeClassifier(),
       retryDelay: envelopeRetryDelay,
     });
 

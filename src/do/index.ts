@@ -8,10 +8,15 @@
 // independent apps share cannot live inside one of them.
 //
 // Module scope must stay inert: no I/O, no timers, no side effects.
-export { ENVELOPE_VERSION, type CallReport } from '../core/index.js';
+export {
+  ENVELOPE_VERSION,
+  CallFailedError,
+  type CallReport,
+} from '../core/index.js';
 export {
   LimiterDO,
   DEFAULT_LIMITER_CONFIG,
+  createEnvelopeClassifier,
   envelopeRetryDelay,
   type LimiterConfig,
   type LimiterStats,

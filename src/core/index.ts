@@ -8,6 +8,7 @@ export {
 } from './envelope.js';
 export {
   Scheduler,
+  CallFailedError,
   createStatusClassifier,
   defaultRetryDelay,
   exponentialBackoff,
@@ -19,6 +20,7 @@ export {
   type RetryContext,
   type RetryDelayCalculator,
   type ResultClassifier,
+  type ResultVerdict,
   type SchedulerOptions,
   type StatusClassifierOptions,
 } from './scheduler.js';

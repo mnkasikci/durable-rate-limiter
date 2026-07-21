@@ -152,11 +152,21 @@ limiter Worker and declare the binding in their own config.
 
 ## Current state
 
-`src/core/` and `src/do/` are done. `src/client/` is still to be written:
-`defineBinder`, `defineTestBinder`, `defineLimiter`, `call()` and the hooks.
+`src/core/`, `src/do/` and `src/client/` are written and at 100% coverage.
 
-The client half will need two things measured during the DO work, both of which
-contradict what the design notes assumed:
+The failure contract is closed in both halves. The layering it settled is worth
+keeping: **`src/core/scheduler.ts` knows nothing about `CallReport`**. The core
+speaks `ResultVerdict` — `{ isRateLimited, failed, retryable, message }` — and
+`createEnvelopeClassifier` in `src/do/limiter-do.ts` is the one place
+`report.failure` is read and mapped onto it. A non-retryable failure rejects
+with `CallFailedError`; a retryable one retries and then rejects. A rate limit
+outranks both, because a 429 is a rate limit first. `envelopeRetryDelay` prefers
+`retryAfterMs` over the raw `Retry-After`, and stays pure — backpressure lives
+on the rate-limited branch of the scheduler and nowhere else.
+
+The following two were measured during the DO work and both contradict what the
+design notes assumed. They shaped the client half and must survive any change
+to it:
 
 ### RPC erases generics even when inferred from an argument
 
@@ -165,10 +175,11 @@ contradict what the design notes assumed:
 assignable to everything, so nothing errors at the call site — type checking
 just silently stops.
 
-`src/do/entrypoint.ts` declares `LimiterRpc` and `LimiterService` for this: the
-generic surface written out by hand, applied once where a stub is obtained.
-Consumers type their service binding as `LimiterService`. Do not let a raw stub
-type reach a call site.
+`src/do/entrypoint.ts` declares `LimiterRpc` and `LimiterService` for this, and
+`src/client/binder.ts` declares `LimiterStub`: the generic surface written out
+by hand, applied once where a stub is obtained — `stubFrom` on the client side
+is the single assertion. Consumers type their service binding as
+`LimiterService`. Do not let a raw stub type reach a call site.
 
 ### A thrown error loses its properties crossing RPC
 

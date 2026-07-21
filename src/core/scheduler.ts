@@ -48,12 +48,52 @@ export interface RetryOptions {
   respectRetryAfter: boolean;
 }
 
+/**
+ * What a classifier makes of a result that *returned* rather than threw.
+ *
+ * Deliberately envelope-agnostic. A caller-side protocol that reports failure
+ * as data — see `CallReport.failure` — cannot be understood here without
+ * dragging wire knowledge into the core, so the host's classifier maps its own
+ * shape onto this vocabulary and the scheduler acts on the vocabulary alone.
+ */
+export interface ResultVerdict {
+  isRateLimited?: boolean;
+  /** The call failed, even though it returned rather than threw. */
+  failed?: boolean;
+  /** Only meaningful with `failed`. Defaults to false — do not retry blindly. */
+  retryable?: boolean;
+  /** Used to build the rejection. */
+  message?: string;
+}
+
 export interface ResultClassifier<U> {
-  classifyResult: (result: U) => { isRateLimited?: boolean };
+  classifyResult: (result: U) => ResultVerdict;
   classifyError: (error: unknown) => {
     isRateLimited?: boolean;
     dontRetry?: boolean;
   };
+}
+
+/**
+ * The rejection a `failed` verdict becomes.
+ *
+ * It crosses RPC on the way back to the caller, which reconstructs an error
+ * from `name`, `message` and `stack` only — so `status` below is legibility for
+ * an in-process caller and nothing more, and anything the caller genuinely
+ * needs goes into the message. That loss is affordable precisely because this
+ * error is terminal: nothing downstream decides anything from it.
+ */
+export class CallFailedError extends Error {
+  /** Stripped by RPC; duplicated into the message for that reason. */
+  readonly status: number | undefined;
+
+  constructor(message: string, status?: number) {
+    super(
+      status === undefined ? message : `${message} (status ${String(status)})`
+    );
+    this.name = 'CallFailedError';
+    this.status = status;
+  }
 }
 
 /** What the retry loop knows about the attempt that just failed. */
@@ -126,6 +166,12 @@ function readStatus(source: Record<string, unknown>): number | undefined {
     return response.status;
   }
   return undefined;
+}
+
+/** The status of a returned result, in the same places the classifier looks. */
+function resultStatus(result: unknown): number | undefined {
+  const record = asRecord(result);
+  return record === undefined ? undefined : readStatus(record);
 }
 
 export interface StatusClassifierOptions {
@@ -312,23 +358,27 @@ export class Scheduler<U = unknown> {
     const attempts = this.#retry.maxRetries + 1;
     let lastError: unknown;
     let lastResult: T | undefined;
-    let failed = false;
+    let threw = false;
+    /** The rejection a `failed` verdict has earned, if the loop runs out. */
+    let failure: CallFailedError | undefined;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
       // Before *every* attempt, not just the first.
       await this.#bucket.consumeAsync(1);
 
-      let outcome: { result: T } | undefined;
+      let outcome: { result: T; verdict: ResultVerdict } | undefined;
       try {
         const result = await fn();
-        if (this.#classify.classifyResult(result).isRateLimited !== true) {
+        const verdict = this.#classify.classifyResult(result);
+        if ((verdict.isRateLimited ?? false) || (verdict.failed ?? false)) {
+          outcome = { result, verdict };
+        } else {
           return result;
         }
-        outcome = { result };
       } catch (error) {
         const verdict = this.#classify.classifyError(error);
         lastError = error;
-        failed = true;
+        threw = true;
         if ((verdict.dontRetry ?? false) || attempt === attempts) break;
 
         const delay = this.#delayFor(attempt, error, undefined, verdict);
@@ -342,20 +392,44 @@ export class Scheduler<U = unknown> {
         continue;
       }
 
-      lastResult = outcome.result;
-      failed = false;
+      const { result, verdict } = outcome;
+      const isRateLimited = verdict.isRateLimited ?? false;
+      lastResult = result;
+      threw = false;
+      failure =
+        (verdict.failed ?? false)
+          ? new CallFailedError(
+              verdict.message ?? 'the call failed',
+              resultStatus(result)
+            )
+          : undefined;
+
+      // A 429 is a rate limit first: it pauses and retries whatever else the
+      // verdict says. Only outside that branch is a non-retryable failure
+      // allowed to end the call, and it ends it here rather than after a wait
+      // nobody is waiting for.
+      if (
+        !isRateLimited &&
+        failure !== undefined &&
+        verdict.retryable !== true
+      ) {
+        throw failure;
+      }
       if (attempt === attempts) break;
 
-      // Pausing the bucket is the wait: the next `consumeAsync` blocks until
-      // the penalty lifts, and every other caller waits with us.
-      this.#bucket.pause(
-        this.#delayFor(attempt, undefined, outcome.result, {
-          isRateLimited: true,
-        })
-      );
+      const delay = this.#delayFor(attempt, undefined, result, verdict);
+      if (isRateLimited) {
+        // Pausing the bucket is the wait: the next `consumeAsync` blocks until
+        // the penalty lifts, and every other caller waits with us.
+        this.#bucket.pause(delay);
+      } else {
+        // A retryable failure is this call's problem alone.
+        await sleep(delay);
+      }
     }
 
-    if (failed) throw lastError;
+    if (threw) throw lastError;
+    if (failure !== undefined) throw failure;
     return lastResult as T;
   }
 

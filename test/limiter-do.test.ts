@@ -207,6 +207,135 @@ describe('LimiterDO.execute', () => {
   });
 });
 
+describe('LimiterDO and the failure envelope', () => {
+  it('rejects on a non-retryable failure instead of resolving with a value', async () => {
+    // The regression this contract closes. Before the object read `failure`,
+    // this call RESOLVED — the caller got a value where it expected a
+    // rejection, and nothing anywhere reported a problem.
+    const stub = limiter('failure-final');
+    await stub.configure(roomy({ retry: { maxRetries: 3, minDelayInMs: 5 } }));
+
+    let attempts = 0;
+    await expect(
+      stub.execute(async () => {
+        attempts++;
+        return {
+          value: 'ignored',
+          status: 404,
+          failure: { message: 'document not found', retryable: false },
+        };
+      })
+    ).rejects.toThrow('document not found (status 404)');
+    expect(attempts).toBe(1);
+  });
+
+  it('retries a retryable failure, then rejects with the last message', async () => {
+    const stub = limiter('failure-retryable');
+    await stub.configure(
+      roomy({ retry: { maxRetries: 2, minDelayInMs: 5, maxDelayInMs: 20 } })
+    );
+
+    let attempts = 0;
+    await expect(
+      stub.execute(async () => {
+        attempts++;
+        return {
+          value: null,
+          status: 503,
+          failure: {
+            message: `unavailable ${String(attempts)}`,
+            retryable: true,
+          },
+        };
+      })
+    ).rejects.toThrow('unavailable 3 (status 503)');
+    expect(attempts).toBe(3);
+  });
+
+  it('recovers when a retryable failure stops failing', async () => {
+    const stub = limiter('failure-recovers');
+    await stub.configure(
+      roomy({ retry: { maxRetries: 2, minDelayInMs: 5, maxDelayInMs: 20 } })
+    );
+
+    let attempts = 0;
+    await expect(
+      stub.execute(async () => {
+        attempts++;
+        return attempts === 1
+          ? {
+              value: 'unused',
+              status: 503,
+              failure: { message: 'unavailable', retryable: true },
+            }
+          : ok('recovered');
+      })
+    ).resolves.toBe('recovered');
+    expect(attempts).toBe(2);
+  });
+
+  it('does not pause the shared bucket for a non-retryable failure', async () => {
+    // A failed call is one caller's problem. Only a rate limit is everyone's.
+    const stub = limiter('failure-no-backpressure');
+    await stub.configure(roomy({ retry: { maxRetries: 2, minDelayInMs: 5 } }));
+
+    await expect(
+      stub.execute(async () => ({
+        value: null,
+        status: 400,
+        failure: { message: 'bad request', retryable: false },
+      }))
+    ).rejects.toThrow('bad request');
+
+    await expect(stub.stats()).resolves.toMatchObject({ penalised: false });
+  });
+
+  it('treats a 429 that also reports a failure as a rate limit first', async () => {
+    const stub = limiter('failure-429');
+    await stub.configure(
+      roomy({ retry: { maxRetries: 1, minDelayInMs: 10, maxDelayInMs: 50 } })
+    );
+
+    let attempts = 0;
+    const value = await stub.execute(async () => {
+      attempts++;
+      return attempts === 1
+        ? {
+            value: 'unused',
+            status: 429,
+            // Non-retryable, and retried regardless: the rate limit wins.
+            failure: { message: 'quota exceeded', retryable: false },
+          }
+        : ok('through');
+    });
+
+    expect(value).toBe('through');
+    expect(attempts).toBe(2);
+  });
+
+  it('waits the envelope’s retryAfterMs rather than the backoff', async () => {
+    const stub = limiter('failure-retry-after-ms');
+    // A backoff floor far below the requested delay, so only retryAfterMs can
+    // account for the time actually spent.
+    await stub.configure(
+      roomy({ retry: { maxRetries: 1, minDelayInMs: 1, maxDelayInMs: 5000 } })
+    );
+
+    let attempts = 0;
+    const started = Date.now();
+    const value = await stub.execute(async () => {
+      attempts++;
+      return attempts === 1
+        ? { value: 'late', status: 429, retryAfterMs: 150 }
+        : ok('late');
+    });
+
+    expect(value).toBe('late');
+    expect(Date.now() - started).toBeGreaterThanOrEqual(140);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
 describe('LimiterDO.configure', () => {
   it('persists limits so they survive eviction', async () => {
     const stub = limiter('configure-persist');
@@ -397,6 +526,29 @@ describe('envelopeRetryDelay', () => {
       context({ result: { value: null, status: 429, retryAfter: '12' } })
     );
     expect(delay).toBe(12_000);
+  });
+
+  it('takes retryAfterMs off the envelope as-is', () => {
+    const delay = envelopeRetryDelay(
+      context({ result: { value: null, status: 429, retryAfterMs: 1234 } })
+    );
+    expect(delay).toBe(1234);
+  });
+
+  it('prefers retryAfterMs when both it and Retry-After are present', () => {
+    // The number is what a `rateLimit` hook already had; rounding it into
+    // stringified seconds and back would only lose precision.
+    const delay = envelopeRetryDelay(
+      context({
+        result: {
+          value: null,
+          status: 429,
+          retryAfter: '30',
+          retryAfterMs: 1500,
+        },
+      })
+    );
+    expect(delay).toBe(1500);
   });
 
   it('takes Retry-After off the envelope as an HTTP-date', () => {
