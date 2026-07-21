@@ -1,0 +1,80 @@
+{
+  "name": "@bakidev/durable-rate-limiter",
+  "version": "0.0.0",
+  "description": "A shared rate limiter and concurrency gate for Cloudflare Workers, backed by a Durable Object.",
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "durable-objects",
+    "rate-limit",
+    "rate-limiter",
+    "concurrency",
+    "token-bucket",
+    "backpressure"
+  ],
+  "license": "MIT",
+  "author": "Nurbaki Kasikci",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bakidev/durable-rate-limiter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bakidev/durable-rate-limiter/issues"
+  },
+  "homepage": "https://github.com/bakidev/durable-rate-limiter#readme",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "exports": {
+    "./do": {
+      "types": "./dist/do.d.ts",
+      "import": "./dist/do.js",
+      "default": "./dist/do.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js",
+      "default": "./dist/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "clean": "rm -rf dist coverage",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run coverage",
+    "prepublishOnly": "npm run clean && npm run check && npm run build"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.9.0",
+    "@cloudflare/workers-types": "^5.20260714.1",
+    "@eslint/js": "^9.32.0",
+    "@vitest/coverage-istanbul": "~3.2.0",
+    "eslint": "^9.32.0",
+    "eslint-config-prettier": "^10.1.0",
+    "prettier": "^3.6.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.38.0",
+    "vitest": "~3.2.0",
+    "wrangler": "^4.26.0"
+  }
+}
