@@ -3,6 +3,22 @@
 // testable and deterministic.
 export { ENVELOPE_VERSION, type EnvelopeVersion } from './envelope.js';
 export {
+  Scheduler,
+  createStatusClassifier,
+  defaultRetryDelay,
+  exponentialBackoff,
+  readRetryAfterMs,
+  DEFAULT_RETRY_OPTIONS,
+  DEFAULT_CONCURRENCY,
+  type Bucket,
+  type RetryOptions,
+  type RetryContext,
+  type RetryDelayCalculator,
+  type ResultClassifier,
+  type SchedulerOptions,
+  type StatusClassifierOptions,
+} from './scheduler.js';
+export {
   TokenBucket,
   BucketDestroyedError,
   type BucketState,
