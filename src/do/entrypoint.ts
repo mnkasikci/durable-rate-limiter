@@ -1,0 +1,116 @@
+import { WorkerEntrypoint } from 'cloudflare:workers';
+
+import { ENVELOPE_VERSION, type CallReport } from '../core/index.js';
+
+import type { LimiterConfig, LimiterDO, LimiterStats } from './limiter-do.js';
+
+/**
+ * The bindings a limiter Worker must declare. One namespace; every named
+ * limiter is an instance on it.
+ */
+export interface LimiterEnv {
+  RATE_LIMITER: DurableObjectNamespace<LimiterDO>;
+}
+
+/** What `ping()` answers with. Concrete, so it survives the RPC boundary. */
+export interface LimiterPing {
+  ok: true;
+  envelopeVersion: number;
+}
+
+/**
+ * The Durable Object's surface as seen through a stub, with the generics RPC
+ * erases put back.
+ *
+ * Measured, not assumed: `DurableObjectStub<LimiterDO>['execute']` resolves to
+ * **`never`** — and `never` is assignable to everything, so the loss does not
+ * even produce an error at the call site, it just silently stops checking. It
+ * happens for `execute<T>(fn: () => Promise<CallReport<T>>)` too, so the
+ * received wisdom that a type parameter inferred from an argument survives the
+ * boundary does not hold here.
+ *
+ * The runtime call is fine; only the type is gone. Widening a stub to this
+ * interface confines the erasure to one line instead of letting `never` leak
+ * into every consumer.
+ */
+export interface LimiterRpc {
+  execute<T>(fn: () => Promise<CallReport<T>>): Promise<T>;
+  configure(config: Partial<LimiterConfig>): Promise<void>;
+  stats(): Promise<LimiterStats>;
+}
+
+/** The same, for the service binding. What a consumer's binding should be typed as. */
+export interface LimiterService {
+  execute<T>(name: string, fn: () => Promise<CallReport<T>>): Promise<T>;
+  configure(name: string, config: Partial<LimiterConfig>): Promise<void>;
+  stats(name: string): Promise<LimiterStats>;
+  ping(): Promise<LimiterPing>;
+}
+
+/**
+ * The RPC surface consuming applications bind to.
+ *
+ * Its whole job is turning `(name, fn)` into `stub(name).execute(fn)`. That
+ * indirection buys three things: a declared interface that can evolve
+ * independently of the object's class name, one place where the
+ * instance-name convention lives, and somewhere for metrics, auth and
+ * per-consumer policy to go later.
+ *
+ * The extra hop costs nothing measurable — a service binding and a direct
+ * cross-script binding differ by ~2 ms warm, all of it noise against
+ * cold-start. Consumers may bypass this and bind `LimiterDO` directly with
+ * `script_name`; that is a supported escape hatch, but it couples every
+ * consumer to the object's class name, so it is not the default.
+ *
+ * `fn` runs in the ORIGINAL caller's isolate — two hops away from here, not in
+ * this Worker and not in the Durable Object. The handle arrives here over the
+ * service binding and is forwarded again to the object; the callback still
+ * resolves back to the consumer.
+ *
+ * NOTE: this must stay a **named** export. A service binding with
+ * `"entrypoint": "LimiterEntrypoint"` resolves against named exports only —
+ * `export default class LimiterEntrypoint` typechecks and then fails at
+ * startup with "has no such named entrypoint". The Worker's own default
+ * export lives separately, in `./index.ts`.
+ */
+export class LimiterEntrypoint
+  extends WorkerEntrypoint<LimiterEnv>
+  implements LimiterService
+{
+  /**
+   * The one place the instance-name convention lives — and the one place the
+   * generic erasure described on `LimiterRpc` is absorbed.
+   */
+  #stub(name: string): LimiterRpc {
+    // The return annotation is doing real work: the generated stub type has
+    // `execute` as `never`, and widening it here is what stops that `never`
+    // reaching consumers. No cast is needed, precisely because `never` is
+    // assignable to anything — which is also why the erasure is so quiet.
+    return this.env.RATE_LIMITER.get(this.env.RATE_LIMITER.idFromName(name));
+  }
+
+  /** Schedule `fn` against the limiter called `name`. */
+  execute<T>(name: string, fn: () => Promise<CallReport<T>>): Promise<T> {
+    return this.#stub(name).execute(fn);
+  }
+
+  /** Set the limits for one named limiter. A setup call, not a per-request one. */
+  configure(name: string, config: Partial<LimiterConfig>): Promise<void> {
+    return this.#stub(name).configure(config);
+  }
+
+  /** Live tokens, penalty state and the raw persisted triple. */
+  stats(name: string): Promise<LimiterStats> {
+    return this.#stub(name).stats();
+  }
+
+  /**
+   * Liveness, and the cheapest possible skew check: the two halves deploy on
+   * independent schedules, so a consumer can compare this against its own
+   * `ENVELOPE_VERSION` at startup instead of discovering the mismatch as
+   * silent mis-limiting.
+   */
+  ping(): Promise<LimiterPing> {
+    return Promise.resolve({ ok: true, envelopeVersion: ENVELOPE_VERSION });
+  }
+}

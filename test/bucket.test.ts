@@ -383,17 +383,25 @@ describe('timers', () => {
     const bucket = new TokenBucket(FAST, {
       state: { tokens: 0, lastRefillAt: Date.now(), forcedUntil: 0 },
     });
-    await bucket.consumeAsync(1);
+    const pending = bucket.consumeAsync(1);
 
-    // Exactly one timer for the whole queue, and it is gone once the queue
-    // drains — a pending timer keeps an idle host from hibernating and bills
-    // duration around the clock.
+    // Asserted across the synchronous window and then unspied, because these
+    // are the *global* timer functions: the test runner schedules timers of
+    // its own while we await, and a global spy cannot tell them apart.
     expect(setSpy).toHaveBeenCalledTimes(1);
     expect(clearSpy).toHaveBeenCalledTimes(0);
-
-    bucket.destroy();
     setSpy.mockRestore();
     clearSpy.mockRestore();
+
+    await pending;
+
+    // And it is gone once the queue drains — a pending timer keeps an idle
+    // host from hibernating and bills duration around the clock. `destroy()`
+    // clears a live timer, so a silent `destroy()` proves there was none.
+    const clearAfter = vi.spyOn(globalThis, 'clearTimeout');
+    bucket.destroy();
+    expect(clearAfter).toHaveBeenCalledTimes(0);
+    clearAfter.mockRestore();
   });
 
   it('never schedules a repeating tick', () => {

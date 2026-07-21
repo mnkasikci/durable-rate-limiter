@@ -20,3 +20,29 @@
 export const ENVELOPE_VERSION = 1;
 
 export type EnvelopeVersion = typeof ENVELOPE_VERSION;
+
+/**
+ * What a caller hands back to the limiter after running its own work.
+ *
+ * An envelope rather than a `Response` is the whole design in one type. The
+ * callback runs in the caller's isolate; returning a `Response` would stream
+ * every byte back through a single-threaded Durable Object to reach the caller
+ * that already had it. A small summary makes that a compile-time shape instead
+ * of a rule someone has to remember.
+ *
+ * `status` and `retryAfter` are the only fields the object reads, and they are
+ * enough for it to detect a rate limit and throttle *every* caller — the
+ * capability an in-process limiter structurally cannot have. It parses nothing
+ * else, knows no upstream, and never sees a credential.
+ *
+ * `status` is deliberately where the default classifier already looks, so the
+ * envelope needs no bespoke classification on the object side.
+ */
+export interface CallReport<T> {
+  /** Keep this small. Large payloads belong in the caller's isolate. */
+  value: T;
+  /** HTTP status of the caller's own request, when there was one. */
+  status?: number;
+  /** Raw `Retry-After` header value; the object parses seconds and HTTP-date. */
+  retryAfter?: string | null;
+}

@@ -5,6 +5,12 @@ export default defineWorkersConfig({
     poolOptions: {
       workers: {
         wrangler: { configPath: './wrangler.jsonc' },
+        // Per-test storage isolation cannot work here: write-through
+        // persistence is deliberately fire-and-forget (`void storage.put`), so
+        // a write can still be in flight when a test ends and the pool fails
+        // trying to pop the storage stack. Tests take a distinct limiter name
+        // each instead, which is the isolation `idFromName` already provides.
+        isolatedStorage: false,
         miniflare: {
           compatibilityFlags: ['nodejs_compat'],
         },

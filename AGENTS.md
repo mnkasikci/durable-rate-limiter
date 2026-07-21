@@ -152,7 +152,42 @@ limiter Worker and declare the binding in their own config.
 
 ## Current state
 
-Scaffold only. `src/do/rate-limiter.ts` is a placeholder class carrying no
-limiter logic — it exists so wrangler can resolve the binding and the test pool
-can back it with a real local Durable Object. The bucket, the queue, the RPC
-surface, the client and the hooks are all still to be written.
+`src/core/` and `src/do/` are done. `src/client/` is still to be written:
+`defineBinder`, `defineTestBinder`, `defineLimiter`, `call()` and the hooks.
+
+The client half will need two things measured during the DO work, both of which
+contradict what the design notes assumed:
+
+### RPC erases generics even when inferred from an argument
+
+`DurableObjectStub<LimiterDO>['execute']` resolves to **`never`**, not to
+`Promise<T>`, and the same happens through a service binding. `never` is
+assignable to everything, so nothing errors at the call site — type checking
+just silently stops.
+
+`src/do/entrypoint.ts` declares `LimiterRpc` and `LimiterService` for this: the
+generic surface written out by hand, applied once where a stub is obtained.
+Consumers type their service binding as `LimiterService`. Do not let a raw stub
+type reach a call site.
+
+### A thrown error loses its properties crossing RPC
+
+Workers RPC reconstructs a thrown error from name/message/stack only. A `status`
+a caller attaches to an `Error` does **not** arrive, so `dontRetry`
+classification on the error path can never fire over RPC and every throw looks
+transient to the object.
+
+The envelope is therefore the whole contract: a failure a caller wants treated
+as final has to be _reported_ as `{ value, status }`, not thrown. The client
+half must convert responses into envelopes rather than throwing on non-2xx, and
+the README must say so.
+
+### Test-pool note
+
+`isolatedStorage` is off in [vitest.config.ts](vitest.config.ts). Write-through
+persistence is deliberately fire-and-forget, so a storage write can still be in
+flight when a test ends, and the pool then fails popping its storage stack.
+Tests take a distinct limiter name each instead, which is the isolation
+`idFromName` already provides. One consequence: global timer spies also see the
+runner's own timers, so assert on a synchronous window and unspy before
+awaiting.

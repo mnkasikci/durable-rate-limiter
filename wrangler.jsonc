@@ -1,7 +1,10 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   // This config exists for tests and local development only. Consumers deploy
-  // their own limiter Worker and declare the binding in their own config.
+  // their own limiter Worker and declare the bindings below in their own
+  // config — the object must live in a Worker of its own, because a Worker
+  // implementing a Durable Object gets no preview URLs and a new DO migration
+  // cannot be uploaded as a version.
   "name": "durable-rate-limiter-dev",
   "main": "src/do/index.ts",
   "compatibility_date": "2025-07-01",
@@ -10,14 +13,27 @@
     "bindings": [
       {
         "name": "RATE_LIMITER",
-        "class_name": "RateLimiterDurableObject",
+        "class_name": "LimiterDO",
       },
     ],
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["RateLimiterDurableObject"],
+      "new_sqlite_classes": ["LimiterDO"],
+    },
+  ],
+  // A self-referencing service binding, so the tests exercise the entrypoint
+  // over a real RPC hop rather than by constructing the class directly. This
+  // is also the exact shape a consumer declares, with "service" naming the
+  // deployed limiter Worker instead of this one. Note "entrypoint": a binding
+  // without it resolves to the default export, and the entrypoint must be a
+  // NAMED export.
+  "services": [
+    {
+      "binding": "LIMITER",
+      "service": "durable-rate-limiter-dev",
+      "entrypoint": "LimiterEntrypoint",
     },
   ],
 }
