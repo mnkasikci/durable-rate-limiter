@@ -83,8 +83,25 @@ Consequences to preserve:
 - bucket state (`{ tokens, lastRefillAt, forcedUntil }`) **is** persisted and is
   refilled from wall-clock elapsed time at read time, so eviction after 70–140
   seconds idle reconstructs the _correct_ token count rather than a full bucket;
-- the queue of waiting callbacks is not, so `call()` is throwable and callers
-  must retry;
+- the queue of waiting callbacks is not, so a parked caller can be dropped —
+  measured at 2.4% of calls (7 of 290, four runs) against a real deployment
+  (`verify/`), which is frequent enough that it cannot be left to consumers;
+- the client therefore retries it, in `src/client/limiter.ts`, and the
+  discriminator must stay **"did the callback ever fire"** — never a message
+  match. A callback that never ran made no upstream request, so the retry is
+  safe even for non-idempotent work. A drop _after_ it ran must keep
+  propagating untouched;
+- `call()` is still throwable — `CallDroppedError` once the attempts are spent
+  (`DEFAULT_DROP_RETRIES` is 5, so six attempts). Every drop goes to `onDrop`
+  whether retried or not, because a silent retry cannot be sized;
+- **do not publish a compounded failure probability** anywhere in the docs. The
+  base rate comes from 7 events in 290 calls (CI 1.2–4.9%) and the drops are not
+  independent — one redeploy takes out every parked caller at once. Raising the
+  rate to the sixth power spans a factor of 5 000 across that interval, and
+  presenting any point in it as a guarantee is false precision. Raising
+  `dropRetries` past ~5 buys little for the same reason: what remains is
+  correlated failure, which retries cannot fix, while each attempt still
+  consumes a token before it runs;
 - this is documented, not hidden. Keep it in the README's known-limits section.
 
 ### 4. Worst-case throughput is `capacity + fillPerWindow`
@@ -160,7 +177,8 @@ the properties neither half can demonstrate alone: the closure running in the
 caller's isolate, a megabyte staying caller-side, peak overlap under the
 concurrency cap, one caller's 429 delaying another that never saw it, a
 body-encoded rate limit pausing the shared bucket where a body-encoded error
-does not, and a lost wait queue rejecting rather than hanging. The unit suites
+does not, and a lost wait queue both rejecting cleanly with retries off and
+re-queueing under the replacement limits with them on. The unit suites
 stay where they are; this one is about the pair. Timing note: `maxDelayInMs`
 clamps a `Retry-After` as well as the backoff, so a low ceiling makes penalties
 expire before an assertion can see them.

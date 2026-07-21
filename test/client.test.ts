@@ -2,6 +2,8 @@ import { env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 
 import {
+  CallDroppedError,
+  DEFAULT_DROP_RETRIES,
   defineBinder,
   defineLimiter,
   defineTestBinder,
@@ -408,5 +410,317 @@ describe('call — error resolution', () => {
       retryAfterMs: 1_000,
       failure: { message: 'bad request', retryable: false },
     });
+  });
+});
+
+/**
+ * A binder whose stub drops the caller — rejecting *without* ever invoking the
+ * callback — for the first `dropFirst` attempts, then behaves.
+ *
+ * That distinction is the entire subject of these tests, so the double models
+ * it directly: a drop is a rejection with the callback untouched, which is what
+ * the platform does when the object is evicted while a caller is parked in its
+ * memory-only queue.
+ */
+function droppingBinder(
+  dropFirst: number,
+  message = 'Network connection lost.'
+): {
+  binder: ReturnType<typeof defineTestBinder>;
+  attempts: () => number;
+  stubsHandedOut: () => number;
+} {
+  let attempts = 0;
+  let stubs = 0;
+  const binder = defineTestBinder({
+    idFromName: (name: string) => name,
+    get: (): LimiterStub => {
+      stubs += 1;
+      return {
+        async execute<T>(fn: () => Promise<CallReport<T>>): Promise<T> {
+          attempts += 1;
+          if (attempts <= dropFirst) throw new Error(message);
+          return (await fn()).value;
+        },
+      };
+    },
+  });
+  return { binder, attempts: () => attempts, stubsHandedOut: () => stubs };
+}
+
+describe('call — dropped while parked', () => {
+  it('retries a caller that was dropped before its callback ever ran', async () => {
+    const { binder, attempts } = droppingBinder(2);
+    let ran = 0;
+
+    const value = await defineLimiter({ binder, name: 'dropped' })
+      .for({})
+      .call(
+        () => {
+          ran += 1;
+          return respond(200);
+        },
+        { read: () => 'ok' }
+      );
+
+    expect(value).toBe('ok');
+    expect(attempts()).toBe(3);
+    // The callback ran only on the attempt that actually got scheduled. The
+    // two drops never reached the upstream at all, which is why retrying them
+    // cannot duplicate anything.
+    expect(ran).toBe(1);
+  });
+
+  it('replaces the stub after a drop, but not on the happy path', async () => {
+    // Reusing the handle whose connection just broke would make every retry an
+    // instant repeat of the same failure — but resolving a new one per attempt
+    // would tax every call that never drops, which is almost all of them.
+    const { binder, stubsHandedOut } = droppingBinder(1);
+    const bound = defineLimiter({ binder, name: 'fresh-stub' }).for({});
+
+    // One handle for the request, from the presence check.
+    expect(stubsHandedOut()).toBe(1);
+
+    await bound.call(() => respond(200), { read: () => 'ok' });
+
+    // Exactly one more, taken because the first attempt was dropped.
+    expect(stubsHandedOut()).toBe(2);
+
+    await bound.call(() => respond(200), { read: () => 'ok' });
+
+    // The second call drops nothing and takes no new handle.
+    expect(stubsHandedOut()).toBe(2);
+  });
+
+  it('gives up with a CallDroppedError once the attempts are spent', async () => {
+    const { binder, attempts } = droppingBinder(Infinity);
+
+    const rejection = defineLimiter({ binder, name: 'spent' })
+      .for({})
+      .call(() => respond(200), { read: () => 'ok' });
+
+    await expect(rejection).rejects.toThrow(CallDroppedError);
+    await expect(rejection).rejects.toThrow(
+      /dropped while queued and never ran/
+    );
+    // The message is the only thing an operator gets from a transport error,
+    // so the original one must survive into it.
+    await expect(rejection).rejects.toThrow(/Network connection lost/);
+    expect(attempts()).toBe(DEFAULT_DROP_RETRIES + 1);
+  });
+
+  it('carries the attempt count and the limiter name on the error', async () => {
+    const { binder } = droppingBinder(Infinity);
+    // Unlike the object side, this error never crosses an RPC boundary, so its
+    // custom properties actually survive to be read.
+    let error: CallDroppedError | undefined;
+    try {
+      await defineLimiter({ binder, name: 'named' })
+        .for({})
+        .call(() => respond(200), { read: () => 'ok' });
+    } catch (caught) {
+      error = caught as CallDroppedError;
+    }
+    if (error === undefined) throw new Error('expected a rejection');
+
+    expect(error.name).toBe('CallDroppedError');
+    expect(error.limiter).toBe('named');
+    expect(error.attempts).toBe(DEFAULT_DROP_RETRIES + 1);
+    expect(error.cause).toBeInstanceOf(Error);
+  });
+
+  it('reports every drop to onDrop, retried or not', async () => {
+    // A silent retry is a retry nobody can size — the drop rate is a property
+    // of the deployment, not of this package.
+    const { binder } = droppingBinder(Infinity);
+    const seen: { attempt: number; willRetry: boolean; limiter: string }[] = [];
+
+    await defineLimiter({
+      binder,
+      name: 'observed',
+      dropRetries: 2,
+      onDrop: ({ attempt, willRetry, limiter }) => {
+        seen.push({ attempt, willRetry, limiter });
+      },
+    })
+      .for({})
+      .call(() => respond(200), { read: () => 'ok' })
+      .catch(() => undefined);
+
+    expect(seen).toEqual([
+      { attempt: 1, willRetry: true, limiter: 'observed' },
+      { attempt: 2, willRetry: true, limiter: 'observed' },
+      { attempt: 3, willRetry: false, limiter: 'observed' },
+    ]);
+  });
+
+  it('opts out entirely at dropRetries: 0', async () => {
+    const { binder, attempts } = droppingBinder(Infinity);
+
+    await expect(
+      defineLimiter({ binder, name: 'no-retry', dropRetries: 0 })
+        .for({})
+        .call(() => respond(200), { read: () => 'ok' })
+    ).rejects.toThrow(CallDroppedError);
+
+    expect(attempts()).toBe(1);
+  });
+
+  it('wraps a non-Error rejection so the hook always receives an Error', async () => {
+    // RPC reconstructs a thrown value as an Error, but a test double or a
+    // future runtime may not, and `DropEvent.error` promises one.
+    const binder = defineTestBinder({
+      idFromName: (name: string) => name,
+      get: (): LimiterStub => ({
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- the non-Error rejection IS the case under test
+        execute: () => Promise.reject('bare string'),
+      }),
+    });
+    let received: unknown;
+
+    await expect(
+      defineLimiter({
+        binder,
+        name: 'non-error',
+        dropRetries: 0,
+        onDrop: ({ error }) => {
+          received = error;
+        },
+      })
+        .for({})
+        .call(() => respond(200), { read: () => 'ok' })
+    ).rejects.toThrow(/bare string/);
+
+    expect(received).toBeInstanceOf(Error);
+  });
+
+  it('does NOT retry once the callback has run', async () => {
+    // The ambiguous case, deliberately left alone: the request may already
+    // have reached the upstream, and a retry the caller did not ask for could
+    // send a payment twice.
+    let ran = 0;
+    const binder = defineTestBinder({
+      idFromName: (name: string) => name,
+      get: (): LimiterStub => ({
+        async execute<T>(fn: () => Promise<CallReport<T>>): Promise<T> {
+          await fn();
+          throw new Error('Network connection lost.');
+        },
+      }),
+    });
+
+    await expect(
+      defineLimiter({ binder, name: 'in-flight' })
+        .for({})
+        .call(
+          () => {
+            ran += 1;
+            return respond(200);
+          },
+          { read: () => 'ok' }
+        )
+    ).rejects.toThrow('Network connection lost.');
+
+    expect(ran).toBe(1);
+  });
+});
+
+describe('call — the drop test is per call, not per binding', () => {
+  it('does not let one call site observe another call site as "ran"', async () => {
+    // The retry hinges on a flag that must be scoped to ONE attempt of ONE
+    // call. `.for(env)` is shared — a request typically makes many calls
+    // through one bound limiter, often concurrently via Promise.all — so if
+    // that flag were ever hoisted out of `call`, a second call site firing its
+    // callback would make a first, still-parked call look as though it had
+    // run. The parked call would then be treated as unsafe to retry and
+    // silently lost.
+    //
+    // This test forces exactly that interleaving: A is dropped WITHOUT its
+    // callback ever running, but only after B's callback has already fired.
+    let releaseB: () => void = () => undefined;
+    const bHasRun = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+
+    let execCount = 0;
+    const binder = defineTestBinder({
+      idFromName: (name: string) => name,
+      get: (): LimiterStub => ({
+        async execute<T>(fn: () => Promise<CallReport<T>>): Promise<T> {
+          execCount += 1;
+          if (execCount === 1) {
+            // A: park until B's callback has fired, then drop without ever
+            // invoking our own callback.
+            await bHasRun;
+            throw new Error('Network connection lost.');
+          }
+          return (await fn()).value;
+        },
+      }),
+    });
+
+    const bound = defineLimiter({ binder, name: 'interleaved' }).for({});
+
+    let aRan = 0;
+    let bRan = 0;
+
+    const [a, b] = await Promise.all([
+      bound.call(
+        () => {
+          aRan += 1;
+          return respond(200);
+        },
+        { read: () => 'a' }
+      ),
+      bound.call(
+        () => {
+          bRan += 1;
+          releaseB();
+          return respond(200);
+        },
+        { read: () => 'b' }
+      ),
+    ]);
+
+    expect(a).toBe('a');
+    expect(b).toBe('b');
+    // A was retried despite B having fired in the meantime, and ran exactly
+    // once — on the retry. A shared flag would leave this at 0 and reject.
+    expect(aRan).toBe(1);
+    expect(bRan).toBe(1);
+    expect(execCount).toBe(3);
+  });
+
+  it('keeps the flag per attempt, so a later attempt cannot inherit an earlier one', async () => {
+    // Same hazard one level down: two attempts of the SAME call. If the flag
+    // outlived an attempt, a first attempt that ran and failed would make a
+    // subsequent drop look unretryable — or worse, the reverse.
+    let execCount = 0;
+    const binder = defineTestBinder({
+      idFromName: (name: string) => name,
+      get: (): LimiterStub => ({
+        async execute<T>(fn: () => Promise<CallReport<T>>): Promise<T> {
+          execCount += 1;
+          // Drop, drop, then serve — with the callback untouched both times.
+          if (execCount <= 2) throw new Error('Network connection lost.');
+          return (await fn()).value;
+        },
+      }),
+    });
+
+    let ran = 0;
+    const value = await defineLimiter({ binder, name: 'per-attempt' })
+      .for({})
+      .call(
+        () => {
+          ran += 1;
+          return respond(200);
+        },
+        { read: () => 'ok' }
+      );
+
+    expect(value).toBe('ok');
+    expect(ran).toBe(1);
+    expect(execCount).toBe(3);
   });
 });

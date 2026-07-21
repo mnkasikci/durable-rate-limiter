@@ -70,6 +70,45 @@ Client errors are not retried; 429 is. Exponential backoff with a configurable
 floor, ceiling and factor, and partial options merged with defaults rather than
 replacing them wholesale.
 
+## Dropped callers are retried for you
+
+The object's wait queue is memory-only — an RPC function handle cannot be
+persisted — so a caller parked in it is dropped if the object is evicted, reset
+or redeployed. Measured across four runs against a real deployment: **7 of 290
+calls (2.4%, 95% CI 1.2–4.9%)**, every one of them dropped *while parked*, at
+waits from 47 s to 8.8 min.
+
+At that rate an application that does not retry loses calls in normal
+operation, so the client retries by default — five times, so a call must be
+dropped six separate times to fail — rather than asking every consumer to write
+the same wrapper. No observed call has been dropped more than once. The decision is exact rather than heuristic: the
+callback runs in *your* isolate, so the client knows whether it ever fired. It
+never did → no request reached the upstream → retrying cannot duplicate
+anything. It did → the call is left alone, because a connection lost after the
+request went out is genuinely ambiguous and guessing could send a payment
+twice.
+
+That makes the retry safe even for non-idempotent work. It is bounded
+(`dropRetries`, default 5), it takes a fresh handle because the old one is what
+broke, and it adds no backoff of its own — a retry must re-acquire a token, so
+the bucket's pacing is already the wait, which also spreads the attempts out in
+time rather than firing them all into one bad window. Once the attempts are spent the call
+rejects with `CallDroppedError`, carrying the attempt count and the original
+transport message.
+
+Every drop is reported to `onDrop`, retried or not, because a silent retry is
+one nobody can size — and the rate is a property of *your* deployment's object
+churn, not of this package's measurements:
+
+```ts
+export const driveLimiter = defineLimiter({
+  binder,
+  name: 'google-docs',
+  onDrop: ({ limiter, attempt, willRetry, error }) =>
+    console.warn(`drop ${limiter} attempt=${attempt} retrying=${String(willRetry)}: ${error.message}`),
+});
+```
+
 ## Survives eviction without a burst
 
 Bucket state is a persisted `{ tokens, lastRefillAt, forcedUntil }` triple,
@@ -131,9 +170,17 @@ A shared limiter nobody can inspect is a shared limiter nobody will trust.
 ## Known limits — stated, not buried
 
 - **The wait queue is memory-only.** An RPC function handle cannot be persisted,
-  so queued callbacks do not survive object eviction. A queued caller keeps the
-  object pinned, making this rare — but `call()` is throwable and callers should
-  retry.
+  so queued callbacks do not survive object eviction — measured at 2.4% of
+  calls under load. The client retries this for you when the callback never
+  ran (see above), but the retry is bounded: `call()` is still throwable, now
+  with `CallDroppedError`, and a caller that must not lose work needs its own
+  durable retry above this one. **No compounded failure probability is
+  published**, because the drop rate is measured from a small sample and the
+  events are not independent — a redeploy drops every parked caller at once.
+  Measure yours with `onDrop`.
+- **A drop after the callback started is never retried automatically.** It
+  cannot be distinguished from a completed upstream request, so it is left to
+  you. Make such calls idempotent, or reconcile them.
 - **`fn` is re-invoked on retry** and must build a fresh request each time. A
   closure over an already-consumed body fails on the second attempt.
 - **The limiter holds no work.** If a caller disconnects, its pending call goes

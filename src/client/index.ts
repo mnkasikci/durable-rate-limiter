@@ -21,6 +21,13 @@ export {
 } from './binder.js';
 
 export {
+  CallDroppedError,
+  DEFAULT_DROP_RETRIES,
+  type DropEvent,
+  type DropHook,
+} from './dropped.js';
+
+export {
   type ErrorHook,
   type FailureDescription,
   type HookSlot,

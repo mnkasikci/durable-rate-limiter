@@ -1,0 +1,17 @@
+{
+  // Separate from the root tsconfig on purpose. The harness is deployed, not
+  // published: it imports from `dist/`, which the root config emits, and a
+  // project cannot both emit a directory and typecheck against it. It also
+  // declares a global `Env` with concrete bindings, which the package's own
+  // tests must not see.
+  //
+  // Run with: npm run verify:typecheck  (after npm run build)
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types"],
+    "noEmit": true,
+    "declaration": false,
+    "emitDeclarationOnly": false
+  },
+  "include": ["limiter/src", "consumer/src"]
+}

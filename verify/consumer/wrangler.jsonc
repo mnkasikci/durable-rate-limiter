@@ -1,0 +1,57 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "drl-verify-consumer",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-07-01",
+  "observability": { "enabled": true },
+
+  // The default topology: this Worker binds the limiter Worker's NAMED RPC
+  // entrypoint. A binding without "entrypoint" resolves to the default export
+  // instead, and `export default class LimiterEntrypoint` fails at startup
+  // with "has no such named entrypoint" — hence the named export.
+  "services": [
+    {
+      "binding": "LIMITER",
+      "service": "drl-verify-limiter",
+      "entrypoint": "LimiterEntrypoint",
+    },
+  ],
+
+  "workflows": [
+    {
+      "name": "drl-verify-probe",
+      "binding": "PROBE",
+      "class_name": "LimiterProbeWorkflow",
+    },
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      // The collector is local to the consumer. A Durable Object rather than
+      // KV: probe instances finish at unpredictable times and the report is
+      // read straight after, so an eventually-consistent read of a missing
+      // instance is indistinguishable from a lost one.
+      {
+        "name": "COLLECTOR",
+        "class_name": "ProbeCollectorDO",
+      },
+      // The other half of the experiment: the SAME limiter, reached in one
+      // hop instead of two. `script_name` binds a class defined in another
+      // Worker — note there is deliberately no `migrations` entry for it here,
+      // because this Worker binds the class, it does not implement it. That
+      // distinction is also what keeps this Worker's preview URLs.
+      {
+        "name": "RATE_LIMITER",
+        "class_name": "LimiterDO",
+        "script_name": "drl-verify-limiter",
+      },
+    ],
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ProbeCollectorDO"],
+    },
+  ],
+}

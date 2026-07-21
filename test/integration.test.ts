@@ -5,8 +5,12 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 
-import { defineBinder, defineLimiter } from '../src/client/index.js';
-import type { BoundLimiter } from '../src/client/index.js';
+import {
+  CallDroppedError,
+  defineBinder,
+  defineLimiter,
+} from '../src/client/index.js';
+import type { BoundLimiter, DropEvent } from '../src/client/index.js';
 import type { LimiterConfig, LimiterDO, LimiterRpc } from '../src/do/index.js';
 import type { BucketState } from '../src/core/index.js';
 
@@ -362,7 +366,7 @@ describe('client + object — durability and its limits', () => {
     expect(restored.tokens).toBeLessThan(9);
   });
 
-  it('rejects a call cleanly when the wait queue is lost', async () => {
+  it('rejects a call cleanly when the wait queue is lost and retries are off', async () => {
     // An RPC function handle cannot be persisted, so the queue is memory-only
     // and a queued caller can be dropped. Documented, not hidden: `call()` is
     // throwable and the rejection has to arrive as one, not as a hang.
@@ -372,7 +376,7 @@ describe('client + object — durability and its limits', () => {
       bucket: { capacity: 1, fillPerWindow: 1, windowInMs: 600_000 },
       concurrency: 5,
     });
-    const bound = defineLimiter({ binder, name }).for(env);
+    const bound = defineLimiter({ binder, name, dropRetries: 0 }).for(env);
 
     await bound.call(async () => json({ ok: true }), { read: readJson });
 
@@ -385,6 +389,51 @@ describe('client + object — durability and its limits', () => {
     // Rebuilding the bucket destroys it, and every waiter on it.
     await ctl.configure({ concurrency: 4 });
 
-    await expect(parked).rejects.toThrow(/destroyed/i);
+    await expect(parked).rejects.toThrow(CallDroppedError);
+  });
+
+  it('re-queues a dropped caller under the limits that replaced the old ones', async () => {
+    // The default, and the reason the retry lives in the package: the caller
+    // never ran, so nothing upstream happened, and the operator has just said
+    // what the limits should be. Failing here would make every consumer write
+    // the same wrapper — and the ones who forgot would lose calls.
+    const name = uniqueName('queue-lost-retry');
+    const ctl = control(name);
+    await ctl.configure({
+      bucket: { capacity: 1, fillPerWindow: 1, windowInMs: 600_000 },
+      concurrency: 5,
+    });
+    const drops: DropEvent[] = [];
+    const bound = defineLimiter({
+      binder,
+      name,
+      onDrop: (event) => drops.push(event),
+    }).for(env);
+
+    await bound.call(async () => json({ ok: true }), { read: readJson });
+
+    let ran = 0;
+    const parked = bound.call(
+      async () => {
+        ran += 1;
+        return json({ ok: true });
+      },
+      { read: readJson }
+    );
+    await sleep(50);
+
+    // Same destruction as above — but now the limits it re-queues under have
+    // tokens, so the caller is served instead of being told to go away.
+    await ctl.configure({
+      bucket: { capacity: 5, fillPerWindow: 5, windowInMs: 1_000 },
+    });
+
+    await expect(parked).resolves.toEqual({ ok: true });
+    // Once, on the attempt that was actually scheduled. The dropped attempt
+    // never reached the callback, which is what makes the retry safe.
+    expect(ran).toBe(1);
+    expect(drops).toHaveLength(1);
+    expect(drops[0]?.willRetry).toBe(true);
+    expect(drops[0]?.attempt).toBe(1);
   });
 });

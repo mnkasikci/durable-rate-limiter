@@ -47,9 +47,16 @@ import {
  * to a full burst against someone else's quota. The **wait queue is
  * memory-only and cannot be otherwise**: an RPC function handle cannot be
  * stored for later use. A queued caller is itself awaiting this object, which
- * keeps it pinned in memory, so eviction mid-queue should be rare — but
- * `execute` is throwable and callers must retry. That is a property of the
- * design, not a caveat to it.
+ * keeps it pinned in memory — but it is not rare enough to ignore: measured at
+ * 2.4% of calls under load against a real deployment, 7 of 290 across four
+ * runs (see `verify/`).
+ *
+ * `execute` is therefore throwable, and the client half retries it rather than
+ * leaving it to every consumer. It can do that safely because the callback
+ * runs in the caller's isolate, so the caller knows whether it ever fired: if
+ * it did not, nothing reached the upstream. Nothing on this side needs to
+ * change for that, and nothing on this side should try to — see
+ * `src/client/dropped.ts`.
  */
 
 /** Storage keys. Stable: renaming one silently resets every deployed limiter. */

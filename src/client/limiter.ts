@@ -26,6 +26,11 @@ import type { CallReport } from '../core/index.js';
 
 import type { Binder, LimiterStub } from './binder.js';
 import {
+  CallDroppedError,
+  DEFAULT_DROP_RETRIES,
+  type DropHook,
+} from './dropped.js';
+import {
   resolveHook,
   type ErrorHook,
   type HookSlot,
@@ -49,6 +54,17 @@ export interface LimiterDefinition {
   rateLimit?: RateLimitHook | null;
   /** Default error detection for this API. */
   error?: ErrorHook | null;
+  /**
+   * Re-queue attempts after being dropped **while parked**. Defaults to
+   * {@link DEFAULT_DROP_RETRIES}; `0` opts out.
+   *
+   * Safe to leave on for non-idempotent work. The retry fires only when the
+   * callback never ran, so there is nothing upstream to duplicate — see
+   * {@link BoundLimiter.call}.
+   */
+  dropRetries?: number;
+  /** Observe every drop, retried or not. See {@link DropHook}. */
+  onDrop?: DropHook;
 }
 
 /** Per-call configuration. `read` is required; the hooks refine the defaults. */
@@ -91,6 +107,20 @@ export interface BoundLimiter {
    *
    * The second form fails on retry with a "body already used" error that looks
    * nothing like a retry problem.
+   *
+   * ## Being dropped while parked
+   *
+   * The object's queue is memory-only, so a caller waiting its turn can be
+   * dropped if the object is evicted or reset — measured at 2.4% of calls
+   * under load. This retries that by default, five times, so a call must be
+   * dropped six separate times before it rejects with a
+   * {@link CallDroppedError}.
+   *
+   * The discriminator is whether `fn` ever ran, which is knowable exactly
+   * because `fn` runs in this isolate: if it never fired, no request was made
+   * and a retry cannot duplicate anything. A connection lost *after* `fn`
+   * started is never retried here — that one is genuinely ambiguous, and
+   * guessing on the caller's behalf could send a payment twice.
    */
   call<T>(
     fn: () => Response | Promise<Response>,
@@ -180,22 +210,85 @@ export function defineLimiter(definition: LimiterDefinition): Limiter {
     name: definition.name,
     for(env: object): BoundLimiter {
       // Resolved once per request rather than per call: the presence check is
-      // the point of this step, and a caller making ten calls should hear about
-      // a mistyped binding once, before any of them run.
-      const stub: LimiterStub = definition.binder.stubFor(env, definition.name);
+      // the point of this step, and a caller making ten calls should hear
+      // about a mistyped binding once, before any of them run.
+      //
+      // Mutable, because a handle whose connection has broken is worth
+      // replacing exactly once for everyone rather than per call — see the
+      // drop branch below.
+      let stub: LimiterStub = definition.binder.stubFor(env, definition.name);
+
+      const maxRetries = definition.dropRetries ?? DEFAULT_DROP_RETRIES;
+
       return {
-        call<T>(
+        async call<T>(
           fn: () => Response | Promise<Response>,
           options: CallOptions<T>
         ): Promise<T> {
-          // The handle crosses to the object; the call itself runs back here.
-          // An unexpected throw from inside `fn` — a genuine bug, a network
-          // failure — is deliberately not caught: it propagates and is retried
-          // as an unknown error, which is the correct default for something
-          // carrying no retryability information at all.
-          return stub.execute<T>(async () =>
-            buildReport(await fn(), options, definition)
-          );
+          for (let attempt = 1; ; attempt++) {
+            /**
+             * Whether the callback ever ran — the whole basis of the retry
+             * decision, and knowable only because the callback runs in this
+             * isolate rather than in the object.
+             *
+             * A holder rather than a bare `let`, because control-flow analysis
+             * cannot see an assignment made inside a callback it did not
+             * invoke: it would narrow the flag to `false` and report the check
+             * below as always-falsy. A property read is re-widened by the
+             * intervening call, which is exactly the truth here.
+             */
+            const ran = { fired: false };
+
+            try {
+              // The handle crosses to the object; the call itself runs back
+              // here. An unexpected throw from inside `fn` — a genuine bug, a
+              // network failure — is deliberately not caught: it propagates
+              // and is retried by the OBJECT as an unknown error, which is the
+              // correct default for something carrying no retryability
+              // information at all.
+              return await stub.execute<T>(async () => {
+                ran.fired = true;
+                return buildReport(await fn(), options, definition);
+              });
+            } catch (error) {
+              // The callback ran, so whatever went wrong is a decision the
+              // object already made — a `CallFailedError`, or retries spent.
+              // Re-running the caller's work here would be a second request
+              // nobody asked for.
+              if (ran.fired) throw error;
+
+              // Everything below is a caller dropped before it ever ran. RPC
+              // reconstructs a thrown value as an Error, but a non-Error can
+              // still arrive from a test double or a future runtime, and the
+              // hook's contract says `error` is an Error.
+              const cause =
+                error instanceof Error ? error : new Error(String(error));
+              const willRetry = attempt <= maxRetries;
+
+              // Reported before the retry, not after: a hook that only fires
+              // on the final failure cannot measure a drop rate, which is the
+              // number an operator actually needs.
+              definition.onDrop?.({
+                limiter: definition.name,
+                attempt,
+                willRetry,
+                error: cause,
+              });
+
+              if (!willRetry) {
+                throw new CallDroppedError(definition.name, attempt, cause);
+              }
+
+              // A fresh handle before going round again. The one we just used
+              // is the thing whose connection broke, so reusing it would make
+              // every retry an instant repeat of the same failure. Replacing
+              // the shared one rather than a local means the next call does
+              // not have to rediscover the breakage for itself.
+              stub = definition.binder.stubFor(env, definition.name);
+              // No backoff: the retry must re-acquire a token before it can
+              // run, so the bucket's own pacing is already the wait.
+            }
+          }
         },
       };
     },

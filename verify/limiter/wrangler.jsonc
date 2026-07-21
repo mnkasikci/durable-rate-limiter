@@ -1,0 +1,27 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "drl-verify-limiter",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-07-01",
+  "observability": { "enabled": true },
+
+  // The object lives in a Worker of its own. Two platform constraints force
+  // this and both are reproduced by deploying it:
+  //   - a Worker implementing a Durable Object gets no preview URLs;
+  //   - a new DO migration cannot be uploaded as a version, only deployed.
+  // The consumer Worker binds this class cross-script and keeps its previews.
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RATE_LIMITER",
+        "class_name": "LimiterDO",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["LimiterDO"],
+    },
+  ],
+}
