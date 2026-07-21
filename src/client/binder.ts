@@ -9,7 +9,7 @@
  * ## Two names, routinely conflated
  *
  * - **binding name** (`RATE_LIMITER`) — the key in `env`, from `wrangler.jsonc`
- * - **instance name** (`google-docs`) — passed to `idFromName`, picks the bucket
+ * - **instance name** (`example-api`) — passed to `idFromName`, picks the bucket
  *
  * They are many-to-one: one class, one binding, several independent limiters.
  * A binder is declared once and reused by every limiter in the application.

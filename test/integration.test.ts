@@ -132,12 +132,12 @@ describe('client + object — where the work actually runs', () => {
       async () => {
         const big = new Uint8Array(1_000_000).fill(7);
         localBytes = big.byteLength;
-        return json({ id: 'drive-file-123', size: big.byteLength });
+        return json({ id: 'file-123', size: big.byteLength });
       },
       { read: async (res) => (await res.json<{ id: string }>()).id }
     );
 
-    expect(id).toBe('drive-file-123');
+    expect(id).toBe('file-123');
     expect(localBytes).toBe(1_000_000);
     // Nothing but the id was reported, so nothing but the id was ever in the
     // object's heap.

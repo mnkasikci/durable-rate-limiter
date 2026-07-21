@@ -148,12 +148,12 @@ describe('defineBinder', () => {
 describe('defineTestBinder', () => {
   it('ignores env entirely and passes the limiter name to idFromName', async () => {
     const { binder, instanceNames } = capturingBinder();
-    const limiter = defineLimiter({ binder, name: 'google-docs' });
+    const limiter = defineLimiter({ binder, name: 'example-api' });
 
     await limiter.for({}).call(() => respond(200), { read: () => 'ok' });
 
-    expect(limiter.name).toBe('google-docs');
-    expect(instanceNames).toEqual(['google-docs']);
+    expect(limiter.name).toBe('example-api');
+    expect(instanceNames).toEqual(['example-api']);
   });
 });
 

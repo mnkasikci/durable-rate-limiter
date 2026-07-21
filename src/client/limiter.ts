@@ -3,7 +3,7 @@
  *
  * ```ts
  * const binder  = defineBinder('RATE_LIMITER');                  // WHICH binding
- * const limiter = defineLimiter({ binder, name: 'google-docs' }); // WHICH bucket + defaults
+ * const limiter = defineLimiter({ binder, name: 'example-api' }); // WHICH bucket + defaults
  * const bound   = limiter.for(env);                               // per request
  * await bound.call(fn, { read });                                 // per call
  * ```
@@ -78,7 +78,7 @@ export interface CallOptions<T> {
    * and return an identifier:
    *
    * ```ts
-   * { read: async (res) => (await uploadToDrive(res.body!, folderId)).id }
+   * { read: async (res) => (await uploadToStorage(res.body!, folderId)).id }
    * ```
    */
   read: (res: Response) => T | Promise<T>;
@@ -191,16 +191,16 @@ async function buildReport<T>(
  * Capture one limiter's configuration. Module scope; performs nothing.
  *
  * ```ts
- * export const driveLimiter = defineLimiter({
+ * export const apiLimiter = defineLimiter({
  *   binder,
- *   name: 'google-docs',
+ *   name: 'example-api',
  *   rateLimit: (res, body) =>
- *     (body as DriveError)?.error?.status === 'RESOURCE_EXHAUSTED'
+ *     (body as ApiError)?.error?.status === 'RATE_LIMIT_EXCEEDED'
  *       ? { retryAfterMs: 60_000 }
  *       : null,
  *   error: (res, body) =>
- *     (body as DriveError)?.error
- *       ? { message: (body as DriveError).error.message, retryable: res.status >= 500 }
+ *     (body as ApiError)?.error
+ *       ? { message: (body as ApiError).error.message, retryable: res.status >= 500 }
  *       : null,
  * });
  * ```

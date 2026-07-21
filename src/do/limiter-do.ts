@@ -18,8 +18,8 @@ import {
 
 /**
  * A global pacer for one upstream API, shared across every caller and every
- * isolate. Addressed by `idFromName(name)`, so `google-docs`, `apify` and
- * `anthropic` are independent buckets on one class and one binding.
+ * isolate. Addressed by `idFromName(name)`, so `example-api`, `billing-api` and
+ * `search-api` are independent buckets on one class and one binding.
  *
  * ## The mechanism
  *

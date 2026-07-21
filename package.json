@@ -1,6 +1,6 @@
 {
   "name": "@bakidev/durable-rate-limiter",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "A shared rate limiter and concurrency gate for Cloudflare Workers, backed by a Durable Object.",
   "keywords": [
     "cloudflare",
@@ -8,7 +8,9 @@
     "durable-objects",
     "rate-limit",
     "rate-limiter",
+    "throttle",
     "concurrency",
+    "429",
     "token-bucket",
     "backpressure"
   ],
@@ -16,12 +18,12 @@
   "author": "Nurbaki Kasikci",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/bakidev/durable-rate-limiter.git"
+    "url": "git+https://github.com/mnkasikci/durable-rate-limiter.git"
   },
   "bugs": {
-    "url": "https://github.com/bakidev/durable-rate-limiter/issues"
+    "url": "https://github.com/mnkasikci/durable-rate-limiter/issues"
   },
-  "homepage": "https://github.com/bakidev/durable-rate-limiter#readme",
+  "homepage": "https://github.com/mnkasikci/durable-rate-limiter#readme",
   "type": "module",
   "sideEffects": false,
   "engines": {
@@ -47,6 +49,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {

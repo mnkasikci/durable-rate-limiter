@@ -54,7 +54,7 @@ Not every API says 429. Two optional hooks handle the ones that don't:
 | Hook | Non-null result means | Scope |
 |---|---|---|
 | `rateLimit` | treat exactly as an HTTP 429 with this delay | **global** — pauses every caller |
-| `error` | treat exactly as if the call threw | **local** — retries this call only |
+| `error` | the call failed; `retryable` decides whether to try again | **local** — retries this call only |
 
 Both resolve in three chained layers — call site, then limiter default, then
 built-in HTTP — each falling through on `null`. The HTTP layer is
@@ -101,9 +101,9 @@ one nobody can size — and the rate is a property of *your* deployment's object
 churn, not of this package's measurements:
 
 ```ts
-export const driveLimiter = defineLimiter({
+export const apiLimiter = defineLimiter({
   binder,
-  name: 'google-docs',
+  name: 'example-api',
   onDrop: ({ limiter, attempt, willRetry, error }) =>
     console.warn(`drop ${limiter} attempt=${attempt} retrying=${String(willRetry)}: ${error.message}`),
 });
@@ -129,8 +129,8 @@ cost what one costs, and a request awaiting I/O burns no CPU.
 
 ## Many limiters, one deployment
 
-Instances are addressed by name, so `google-docs`, `apify` and `anthropic` are
-independent buckets on one class and one binding. `defineBinder` is declared
+Instances are addressed by name, so `example-api`, `billing-api` and
+`search-api` are independent buckets on one class and one binding. `defineBinder` is declared
 once and reused.
 
 ## Typechecked bindings
