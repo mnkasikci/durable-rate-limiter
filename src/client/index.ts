@@ -8,4 +8,30 @@
 // against different definitions of the wire shape.
 export { ENVELOPE_VERSION, type CallReport } from '../core/index.js';
 
-// defineBinder / defineTestBinder / defineLimiter land here.
+export {
+  defineBinder,
+  defineTestBinder,
+  type Binder,
+  type DoBindings,
+  // The generics RPC erases, declared back by hand. Exported so a consumer
+  // taking the `script_name` escape hatch has the same one-line assertion
+  // available instead of letting a `never`-typed stub reach a call site.
+  type LimiterStub,
+  type NamespaceLike,
+} from './binder.js';
+
+export {
+  type ErrorHook,
+  type FailureDescription,
+  type HookSlot,
+  type RateLimitHook,
+  type RateLimitSignal,
+} from './hooks.js';
+
+export {
+  defineLimiter,
+  type BoundLimiter,
+  type CallOptions,
+  type Limiter,
+  type LimiterDefinition,
+} from './limiter.js';

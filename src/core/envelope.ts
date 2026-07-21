@@ -45,4 +45,34 @@ export interface CallReport<T> {
   status?: number;
   /** Raw `Retry-After` header value; the object parses seconds and HTTP-date. */
   retryAfter?: string | null;
+  /**
+   * A body-derived delay in milliseconds, preferred over `retryAfter` when
+   * present.
+   *
+   * Set by a client-side `rateLimit` hook, which is the only place that can
+   * produce it: the delay is buried in a response body whose shape is a
+   * property of the upstream API, and the body never leaves the caller's
+   * isolate. A number rather than stringified seconds because that is what the
+   * hook already has — round-tripping it through the header format would lose
+   * sub-second precision for no gain.
+   */
+  retryAfterMs?: number;
+  /**
+   * A failed call, described as DATA rather than thrown.
+   *
+   * Workers RPC reconstructs a thrown error from `name`, `message` and `stack`
+   * alone, so every custom property is stripped crossing the boundary — a
+   * `status`, a `code`, a `retryable` flag. Retryability therefore cannot be
+   * signalled by throwing: the error arrives on the object side indistinguish-
+   * able from a network blip, and a 404 is retried to exhaustion.
+   *
+   * This field is how the decision survives the hop. `retryable: false` means
+   * final; the object must not try again. Only when retries are exhausted does
+   * the failure become a rejection, rebuilt from `message` — and that rejection
+   * is terminal, so losing structure at that point costs nothing.
+   */
+  failure?: {
+    message: string;
+    retryable: boolean;
+  };
 }
