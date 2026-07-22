@@ -1,8 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
 
-import type { LimiterRpc } from './entrypoint.js';
+import type { LimiterEnv, LimiterRpc } from './entrypoint.js';
 import {
-  DEFAULT_CONCURRENCY,
+  NO_SUCH_LIMITER,
   Scheduler,
   TokenBucket,
   createStatusClassifier,
@@ -62,6 +62,32 @@ import {
 /** Storage keys. Stable: renaming one silently resets every deployed limiter. */
 const STATE_KEY = 'bucket-state';
 const CONFIG_KEY = 'config';
+/**
+ * The name this bucket was configured under.
+ *
+ * Stored because it cannot be derived: `ctx.id.name` is `undefined` inside a
+ * Durable Object — the name lives on the ID the *caller* built with
+ * `idFromName`, and the object is handed one stripped of it. Persisting the one
+ * `configure` supplies is what lets a bucket describe itself in `stats` and
+ * re-register itself without being told who it is.
+ */
+const NAME_KEY = 'name';
+/** The registry's name list. Only ever present on the registry instance. */
+const NAMES_KEY = 'names';
+
+/**
+ * The instance that holds the list of every other instance's name.
+ *
+ * A namespace cannot be enumerated: there is no `list()`, and `idFromName` is
+ * one-way, so even the REST API that lists objects returns IDs nobody can turn
+ * back into names. Something therefore has to keep the list, and one reserved
+ * instance of this same class is the cheapest thing that can — no second class,
+ * no second binding, no migration.
+ *
+ * The leading space is what reserves it: `isValidInstanceName` in the CLI
+ * rejects this string, so a real bucket can never collide with it.
+ */
+export const REGISTRY_NAME = ' registry';
 
 /** The limits of one named limiter. Persisted verbatim, so keep it cloneable. */
 export interface LimiterConfig {
@@ -73,20 +99,53 @@ export interface LimiterConfig {
 }
 
 /**
- * Sized by the rule that bites everyone once: worst-case throughput is
- * `capacity + fillPerWindow`, not `fillPerWindow`. This delivers at most 60 in
- * a rolling minute, which is the shape of a documented 60/min upstream cap.
+ * Thrown by `execute`, `stats` and `reconfigure` on a bucket that does not
+ * exist — which is the same thing as one that was never configured.
+ *
+ * There is deliberately no default configuration to fall back on. A limiter
+ * nobody configured is almost always a mistyped instance name, and pacing it at
+ * a plausible-looking default turns that typo into a *second* bucket running at
+ * an invented rate against the same upstream quota: invisible, and exactly the
+ * failure this package exists to prevent. A rate limit is never assumed.
+ *
+ * Refusing is also what makes an unconfigured bucket a non-entity rather than a
+ * state. Nothing writes storage before `configure`, so such an object holds
+ * zero bytes and is indistinguishable from one that was never addressed — which
+ * is what lets `listNames` be trusted: every bucket that can run has been
+ * configured, so every bucket that can run is in the registry.
+ *
+ * Only the MESSAGE survives the trip to a caller. Workers RPC delivers this as
+ * a plain `Error` with `name === 'Error'` and every custom property stripped —
+ * so both halves of what a caller needs have to be in the text: the remedy, for
+ * a human, and {@link NO_SUCH_LIMITER}, for the client, which must not retry
+ * this the way it retries a caller dropped in transit.
  */
-export const DEFAULT_LIMITER_CONFIG: LimiterConfig = {
-  bucket: { capacity: 10, fillPerWindow: 50, windowInMs: 60_000 },
-  concurrency: DEFAULT_CONCURRENCY,
-};
+export class LimiterNotConfiguredError extends Error {
+  constructor() {
+    super(
+      `${NO_SUCH_LIMITER} No such limiter: it has never been configured, so it ` +
+        'does not exist and does not know what rate to pace at. That is usually ' +
+        'a mistyped instance name. Create it with `npx ' +
+        '@bakidev/durable-rate-limiter configure`, or call ' +
+        'configure(name, limits) from a deploy step.'
+    );
+    // Useful to anything catching this inside the object; erased on the way
+    // out, which is what NO_SUCH_LIMITER is for.
+    this.name = 'LimiterNotConfiguredError';
+  }
+}
 
 /**
  * What `stats()` reports. A concrete interface, not an inferred return type:
  * RPC erases generics and is happier with a declared shape it can round-trip.
  */
 export interface LimiterStats {
+  /**
+   * The name this bucket was configured under, so a stats blob identifies
+   * itself. Read from storage rather than from the object's own ID, which
+   * carries no name — see {@link REGISTRY_NAME} and `configure`.
+   */
+  name: string;
   /** Live token count, refilled to now. Fractional. */
   tokens: number;
   /** Whether a penalty window is currently in force. */
@@ -103,6 +162,7 @@ export interface LimiterStats {
 
 /** The runtime a limiter lazily builds around its restored state. */
 interface Runtime {
+  name: string;
   config: LimiterConfig;
   bucket: TokenBucket;
   scheduler: Scheduler<CallReport<unknown>>;
@@ -183,7 +243,7 @@ export function createEnvelopeClassifier(): ResultClassifier<
   };
 }
 
-export class LimiterDO extends DurableObject implements LimiterRpc {
+export class LimiterDO extends DurableObject<LimiterEnv> implements LimiterRpc {
   /**
    * Memoised as a *promise*, not a value. Two concurrent `execute` calls that
    * both await a storage read would otherwise each build a bucket, and the
@@ -217,26 +277,84 @@ export class LimiterDO extends DurableObject implements LimiterRpc {
   }
 
   /**
-   * Override the limits for this named instance.
+   * Create this bucket, or restate it — with a **complete** set of limits.
    *
-   * Persisted, so it survives eviction, and it invalidates the cached runtime
-   * so the new limits take effect on the next call. A setup call, not a
-   * per-request one: rebuilding the bucket rejects anyone currently queued,
-   * which is the honest signal that their wait will never be satisfied under
-   * the limits they were waiting on.
+   * The config is not a patch. There is no default to merge onto, because a
+   * rate limit is never assumed; see {@link LimiterNotConfiguredError}. To
+   * adjust one field of a bucket that already exists, use {@link reconfigure}.
+   *
+   * `name` is what the caller addressed this object by. The object cannot work
+   * it out for itself — `ctx.id.name` is `undefined` in here, because the name
+   * lives on the ID the *caller* built with `idFromName` and the object is
+   * handed one stripped of it — so it is passed in, persisted, and used to
+   * enter the registry. This is the only call that carries it, and every live
+   * bucket passes through here at least once, which is what makes
+   * {@link listNames} trustworthy rather than best-effort.
+   *
+   * A setup call, not a per-request one: rebuilding the bucket rejects anyone
+   * currently queued, which is the honest signal that their wait will never be
+   * satisfied under the limits they were waiting on.
+   *
+   * ## Creation is all-or-nothing
+   *
+   * Registering and configuring must not come apart, and they are writes to two
+   * different objects — so there is no transaction available to hold them
+   * together, only a saga. Registration goes first, because the surviving
+   * failure must be a name in the list with no bucket behind it (cosmetic, and
+   * pruned on the next `stats`) and never a live bucket nobody can see. If the
+   * config write then fails on a bucket that did not previously exist, the
+   * registration is compensated and the object erases itself: nothing of value
+   * existed yet, so leaving a half-built one behind serves nobody.
+   *
+   * That erasure is deliberately limited to creation. A failed *restatement* of
+   * an existing bucket leaves it exactly as it was — wiping live token state
+   * would hand out a full burst against someone else's quota on the next call,
+   * which is the failure this package exists to prevent.
    */
-  async configure(patch: Partial<LimiterConfig>): Promise<void> {
-    const current = await this.#ready();
-    const next: LimiterConfig = { ...current.config, ...patch };
-
+  async configure(name: string, config: LimiterConfig): Promise<void> {
     // Construct before persisting: an invalid bucket shape must fail the
     // caller's `configure` rather than being written and then wedging every
     // later `execute` on a restore that throws.
+    new TokenBucket(config.bucket).destroy();
+
+    const existed =
+      (await this.ctx.storage.get<LimiterConfig>(CONFIG_KEY)) !== undefined;
+
+    await this.#registry().registerName(name);
+
+    try {
+      await this.ctx.storage.put(NAME_KEY, name);
+      await this.ctx.storage.put(CONFIG_KEY, config);
+    } catch (error: unknown) {
+      if (!existed) await this.#abandon(name);
+      throw error;
+    }
+
+    await this.#invalidate();
+  }
+
+  /**
+   * Adjust the limits of a bucket that already exists.
+   *
+   * A patch, merged onto what is in force. Throws
+   * {@link LimiterNotConfiguredError} when there is nothing to merge onto —
+   * there is no base to invent one from, and a half-specified bucket is exactly
+   * the thing `configure` refuses to create.
+   *
+   * It takes no name and touches no registry: an existing bucket is already
+   * registered, so a modification has nothing to record. That is also why it
+   * never erases anything on failure — the previous limits simply stay in
+   * force.
+   */
+  async reconfigure(patch: Partial<LimiterConfig>): Promise<void> {
+    const stored = await this.ctx.storage.get<LimiterConfig>(CONFIG_KEY);
+    if (stored === undefined) throw new LimiterNotConfiguredError();
+
+    const next: LimiterConfig = { ...stored, ...patch };
     new TokenBucket(next.bucket).destroy();
 
     await this.ctx.storage.put(CONFIG_KEY, next);
-    this.#runtime = undefined;
-    current.bucket.destroy();
+    await this.#invalidate();
   }
 
   /**
@@ -245,13 +363,14 @@ export class LimiterDO extends DurableObject implements LimiterRpc {
    * will trust.
    */
   async stats(): Promise<LimiterStats> {
-    const { bucket, scheduler, config } = await this.#ready();
+    const { name, bucket, scheduler, config } = await this.#ready();
     // One clock reading for the whole answer: Date.now() is frozen between
     // I/O anyway, and two readings would let `tokens` and `penalised`
     // disagree about which instant they describe.
     const now = Date.now();
     const state = bucket.getState(now);
     return {
+      name,
       tokens: state.tokens,
       penalised: state.forcedUntil > now,
       forcedUntil: state.forcedUntil,
@@ -259,6 +378,85 @@ export class LimiterDO extends DurableObject implements LimiterRpc {
       state,
       config,
     };
+  }
+
+  /**
+   * Record a bucket's name. Called on the registry instance and nowhere else.
+   *
+   * Idempotent, and called unconditionally rather than behind a per-bucket
+   * "already registered" flag. Such a flag would be a second copy of a fact the
+   * list already holds, and copies drift: a registry that lost its list could
+   * never be repopulated, because every bucket would believe it had already
+   * reported itself.
+   *
+   * Deliberately touches storage and nothing else: the registry is not a
+   * limiter, and building a bucket and a scheduler for it would be state that
+   * exists only to be ignored.
+   */
+  async registerName(name: string): Promise<void> {
+    const names = (await this.ctx.storage.get<string[]>(NAMES_KEY)) ?? [];
+    if (names.includes(name)) return;
+    await this.ctx.storage.put(NAMES_KEY, [...names, name].sort());
+  }
+
+  /**
+   * Forget a name — the compensating half of `configure`'s saga, and the repair
+   * a reader performs when a listed name turns out to have no bucket behind it.
+   *
+   * Repair-on-read matters more than the compensation: a compensation only
+   * fixes the failure that ran it, and can itself fail, whereas pruning while
+   * listing corrects drift from any cause.
+   */
+  async unregisterName(name: string): Promise<void> {
+    const names = (await this.ctx.storage.get<string[]>(NAMES_KEY)) ?? [];
+    if (!names.includes(name)) return;
+    await this.ctx.storage.put(
+      NAMES_KEY,
+      names.filter((held) => held !== name)
+    );
+  }
+
+  /**
+   * Every bucket in this namespace, so an operator can ask "what is running?"
+   * without already knowing the answer — the one question that cannot be put to
+   * a bucket, since addressing one means naming it.
+   *
+   * Trustworthy rather than best-effort: a name gets here on `configure`, and a
+   * bucket that was never configured cannot run and holds no storage at all. So
+   * no live bucket is missing from this list.
+   */
+  async listNames(): Promise<string[]> {
+    return (await this.ctx.storage.get<string[]>(NAMES_KEY)) ?? [];
+  }
+
+  /** The reserved instance holding the name list. */
+  #registry(): LimiterRpc {
+    return this.env.RATE_LIMITER.getByName(REGISTRY_NAME);
+  }
+
+  /**
+   * Undo a creation that did not complete: leave the registry as it was and
+   * erase whatever reached storage, so a failed `configure` leaves a non-entity
+   * rather than a half-built bucket.
+   */
+  async #abandon(name: string): Promise<void> {
+    try {
+      await this.#registry().unregisterName(name);
+    } catch {
+      // The name outlives the bucket. Harmless, and the next `stats` prunes it
+      // — which is why the repair is on the read path and not only here.
+    }
+    await this.ctx.storage.deleteAll();
+    this.#runtime = undefined;
+  }
+
+  /** Drop the cached runtime so the next call restores under the new limits. */
+  async #invalidate(): Promise<void> {
+    // Taken from the memoised promise rather than from `#ready()`, so an object
+    // that has not run anything yet is not made to restore just to be torn down.
+    const cached = this.#runtime;
+    this.#runtime = undefined;
+    (await cached)?.bucket.destroy();
   }
 
   #ready(): Promise<Runtime> {
@@ -273,12 +471,20 @@ export class LimiterDO extends DurableObject implements LimiterRpc {
   }
 
   async #restore(): Promise<Runtime> {
-    const [storedConfig, storedState] = await Promise.all([
+    const [storedConfig, storedName, storedState] = await Promise.all([
       this.ctx.storage.get<LimiterConfig>(CONFIG_KEY),
+      this.ctx.storage.get<string>(NAME_KEY),
       this.ctx.storage.get<BucketState>(STATE_KEY),
     ]);
 
-    const config = storedConfig ?? DEFAULT_LIMITER_CONFIG;
+    // No default to fall back on, by design. See LimiterNotConfiguredError:
+    // a bucket nobody configured does not exist, and pacing it at a
+    // plausible-looking invented rate is how a mistyped name stays invisible.
+    if (storedConfig === undefined) throw new LimiterNotConfiguredError();
+    const config = storedConfig;
+    const name = storedName ?? '';
+
+    this.#reregister(name);
 
     const bucket = new TokenBucket(config.bucket, {
       // A restored snapshot refills from wall-clock elapsed time at read time,
@@ -307,6 +513,32 @@ export class LimiterDO extends DurableObject implements LimiterRpc {
       retryDelay: envelopeRetryDelay,
     });
 
-    return { config, bucket, scheduler };
+    return { name, config, bucket, scheduler };
+  }
+
+  /**
+   * Re-assert this bucket's membership of the registry, once per object
+   * lifetime.
+   *
+   * The other half of the repair `unregisterName` describes: pruning fixes
+   * names with no bucket, this fixes buckets with no name. Together they mean a
+   * registry that was damaged converges back on the truth rather than staying
+   * wrong until somebody notices.
+   *
+   * Fired and forgotten, because it is bookkeeping: it must never delay a
+   * caller and must never fail an `execute`. `registerName` is idempotent, so
+   * the steady-state cost is one round trip per cold start and no write.
+   */
+  #reregister(name: string): void {
+    if (name === '' || name === REGISTRY_NAME) return;
+
+    this.ctx.waitUntil(
+      this.#registry()
+        .registerName(name)
+        .catch(() => {
+          // Retried on the next lifetime; a gap in `stats` is not worth
+          // failing a caller's real work over.
+        })
+    );
   }
 }

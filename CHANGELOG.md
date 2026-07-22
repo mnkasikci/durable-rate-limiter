@@ -12,6 +12,22 @@ A change to it is always a breaking change and is called out explicitly below.
 
 ### Added
 
+- **`listNames()`** on `LimiterDO` and `LimiterEntrypoint` — every bucket in the
+  namespace, which is the one question that cannot be put to a bucket, since
+  addressing one means already knowing its name. A Durable Object namespace
+  cannot be enumerated: there is no `list()`, and `idFromName` does not run
+  backwards, so even the REST API that lists objects returns IDs nobody can turn
+  back into names. One reserved instance (`REGISTRY_NAME`) keeps the list
+  instead — no second class, no second binding, no migration. A name gets into
+  it on `configure`, and the changes below are what make the list trustworthy
+  rather than best-effort.
+- **CLI** — `stats --save` writes the live limits back over the limits file, and
+  `sample` writes an example one offline. `--save` needs no existing file and no
+  bucket names, because the registry supplies them: it is how you get an
+  accurate limits file for a limiter you inherited, or recover one you lost. The
+  sample marks itself with `"source": "sample"`, and `configure` asks before
+  applying a file that still carries it — refusing outright under `--yes`, since
+  nobody is there to notice invented numbers reaching a live limiter.
 - **CLI** — `npx @bakidev/durable-rate-limiter init` walks the README's five
   setup steps interactively: scaffolds the limiter Worker and offers to deploy
   it, inserts the binding into an existing wrangler config (by textual
@@ -24,8 +40,13 @@ A change to it is always a breaking change and is called out explicitly below.
   Object, so only a deployed Worker can call it and no `wrangler` command
   reaches one. `init` therefore offers to scaffold the limiter Worker with a
   key-guarded `/configure` and `/stats` route, and to declare the limits beside
-  it in `limits.ts`: they live in version control, change in a diff, and are
-  applied by `configure` after a deploy. `init` sets the guarding secret and
+  it in `durable-rate-limiter.limits.jsonc`: they live in version control,
+  change in a diff, and are uploaded by `configure`. That file is **never
+  deployed and never imported** — the limits are durable state inside the
+  object, and the file is the copy you keep — so retuning a limit costs one
+  command and no deploy. It is JSONC rather than TypeScript precisely because a
+  TypeScript file would have to be imported by the Worker, which is what made a
+  limit change a code change. `init` sets the guarding secret and
   applies them itself, so the bucket is live before it exits. Both routes deny
   everything while `DRL_CONFIG_KEY` is unset — one name for the Worker secret
   and the environment variable the CLI reads, so the two are recognisably the
@@ -37,6 +58,61 @@ A change to it is always a breaking change and is called out explicitly below.
   comment saying what deleting it breaks, holds no secrets, and stores every
   path relative to itself. `configure` and `stats` find it from anywhere in the
   project and never climb past a repository root.
+
+### Changed
+
+- **BREAKING — `configure` splits into `configure` and `reconfigure`.**
+  `configure(name, config)` creates a bucket and takes a **complete** config;
+  `reconfigure(patch)` adjusts one that already exists and throws if there is
+  nothing to adjust. Only `configure` carries the name — a Durable Object cannot
+  recover the name it was addressed by, since `ctx.id.name` is `undefined`
+  inside one, and it needs one to enter the registry. A modification has nothing
+  to register, so it needs none. The split puts the rule in the type system:
+  an incomplete initial configuration is now unrepresentable.
+- **BREAKING — `DEFAULT_LIMITER_CONFIG` is gone.** A rate limit is never
+  assumed. It was not a safe default but a plausible-looking guess, and there is
+  no correct value for an upstream nobody has asked about.
+- **BREAKING — a bucket that was never configured does not exist.** `execute`,
+  `stats` and `reconfigure` throw `LimiterNotConfiguredError`; nothing writes
+  storage before `configure`, so such an object holds zero bytes and is
+  indistinguishable from one that was never addressed. A limiter nobody
+  configured is almost always a mistyped instance name, and the old fallback
+  turned that into a second bucket pacing at an invented rate against the same
+  upstream quota — invisible, and exactly the failure this package exists to
+  prevent. It is also what makes `listNames()` trustworthy.
+- **Creation is all-or-nothing.** Registering and configuring are writes to two
+  different objects, so there is no transaction to hold them together — only a
+  saga. Registration goes first, so the survivable failure is a name with no
+  bucket (cosmetic) rather than a live bucket nobody can see. If the config
+  write then fails on a bucket that did not previously exist, the registration
+  is compensated and the object erases itself; a failed _restatement_ of an
+  existing bucket changes nothing, since wiping live token state would hand out
+  a full burst. Any name that slips through regardless is pruned the next time
+  `stats` walks the list, and a bucket missing from the list re-adds itself from
+  its own persisted name — so the registry converges from both directions.
+- `stats()` now reports the `name` it was configured under, read from storage
+  because the object's own ID carries none.
+- **`NoSuchLimiterError`** on `./client`, thrown by `call()` when the bucket
+  does not exist. It used to surface as a `CallDroppedError` after six pointless
+  retries, because the client treats any rejection that arrives before the
+  callback fired as a caller dropped in transit — true of a broken connection,
+  and wrong for a limiter that will never exist however many times you ask. The
+  six phantom `onDrop` events were the worse half: that hook exists so an
+  operator can size their _real_ drop rate, and a single mistyped instance name
+  was poisoning the only number available for it.
+- **`NO_SUCH_LIMITER` and `isNoSuchLimiter`** on the shared envelope contract,
+  which is how the client tells those two apart. Measured, not assumed: an error
+  thrown inside a Durable Object reaches the caller as a plain `Error` with
+  `name === 'Error'` and every custom property stripped — `instanceof` and
+  `.name` are both useless across the hop, so the marker is written into the
+  message explicitly. It lives beside `ENVELOPE_VERSION` because it is a wire
+  contract, and it does not lean on the runtime folding the class name into the
+  message, which is undocumented behaviour. Skew degrades safely in both
+  directions.
+- **CLI** — `configure` no longer offers to deploy. It never needed to; the
+  offer existed only because the limits used to be compiled into the Worker. If
+  a Worker deployed before this change ignores an upload, `configure` says so
+  and asks for one redeploy rather than reporting a success that did not happen.
 
 ## [0.1.0] — 2026-07-21
 

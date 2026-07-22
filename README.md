@@ -217,25 +217,57 @@ export default {
 That call may `await` for minutes. That is the design, and it is cheap — see
 [what waiting costs](#what-waiting-costs).
 
-### 5. Set your limits (once)
+### 5. Set your limits — this is what creates the bucket
 
-Without this you get the defaults: `{ capacity: 10, fillPerWindow: 50, windowInMs: 60_000 }`
-and `concurrency: 5` — a worst case of exactly 60 calls a minute. `configure` is
-a **setup call, not a per-request one**; it is persisted, and it rejects anyone
-currently queued.
+**A rate limit is never assumed.** There is no default configuration. A bucket
+that has never been configured **does not exist**: it holds zero bytes of
+storage, and `execute` and `stats` on it throw `LimiterNotConfiguredError`
+rather than pacing it at some invented rate.
+
+That is deliberate, and it is the difference between a typo you find in
+development and one you find when your API key is banned. A mistyped instance
+name is not an error anywhere else in the system — it is simply a _different
+bucket_ — so a fallback default would turn it into a second limiter running at a
+plausible-looking rate against the same upstream quota, invisibly, possibly
+taking down every other application sharing that quota with you.
+
+It also makes `listNames()` trustworthy: a name enters the registry when it is
+configured, and nothing that was not configured can run, so nothing live is
+missing from the list.
+
+`configure` is a **setup call, not a per-request one**; it is persisted, and it
+rejects anyone currently queued.
 
 ```ts
 // Run once — from a deploy script, an admin route, or a guarded first-run path.
-const stub = env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName('example-api'));
+const stub = env.RATE_LIMITER.getByName('example-api');
 
-await stub.configure({
+// The name goes in twice on purpose: once to address the object, once so the
+// object knows what it is called. It cannot work that out for itself —
+// `ctx.id.name` is undefined inside a Durable Object — and it needs a name to
+// enter the registry that makes `listNames()` possible.
+//
+// The config is COMPLETE, not a patch. There is nothing to merge a fragment
+// onto, and a half-specified bucket is exactly what this refuses to create.
+await stub.configure('example-api', {
   bucket: { capacity: 5, fillPerWindow: 55, windowInMs: 60_000 },
   concurrency: 5,
   retry: { maxRetries: 3, maxDelayInMs: 30_000 },
 });
 
-console.log(await stub.stats()); // live tokens, penalty state, in-flight, config
+console.log(await stub.stats()); // name, live tokens, penalty state, in-flight
+
+// To change one knob later, patch it. No name, because an existing bucket is
+// already registered — and it throws if there is nothing there to patch.
+await stub.reconfigure({ concurrency: 8 });
 ```
+
+Creation is all-or-nothing. Registering and configuring are writes to two
+different objects, so there is no transaction to hold them together — the
+registration goes first, so the only survivable failure is a name with no bucket
+behind it, never a live bucket nobody can see. If the config write then fails,
+the registration is undone and the object erases itself; and any name that slips
+through anyway is pruned the next time `stats` walks the list.
 
 ---
 
@@ -253,14 +285,14 @@ npx @bakidev/durable-rate-limiter init
 It walks the five steps in the order they must happen — the limiter Worker
 first, because a consumer's binding names it — and for each one:
 
-| Step           | What `init` does                                                                                                     |
-| -------------- | -------------------------------------------------------------------------------------------------------------------- |
-| limiter Worker | scaffolds `src/index.ts` and `wrangler.jsonc`                                                                        |
-| binding        | asks which topology, then inserts the binding into your existing config                                              |
-| types          | offers to run `wrangler types`, so `defineBinder` typechecks the binding name                                        |
-| limiter module | writes `src/limiter.ts` with the binder and the instance name — the name written once                                |
-| limits         | asks your upstream's real limit and sizes `capacity + fillPerWindow` to fit under it                                 |
-| deploy         | deploys the limiter Worker, sets its guard secret, and applies those limits — the bucket is live before `init` exits |
+| Step           | What `init` does                                                                                                      |
+| -------------- | --------------------------------------------------------------------------------------------------------------------- |
+| limiter Worker | scaffolds `src/index.ts` and `wrangler.jsonc`                                                                         |
+| binding        | asks which topology, then inserts the binding into your existing config                                               |
+| types          | offers to run `wrangler types`, so `defineBinder` typechecks the binding name                                         |
+| limiter module | writes `src/limiter.ts` with the binder and the instance name — the name written once                                 |
+| limits         | asks your upstream's real limit, sizes `capacity + fillPerWindow` to fit under it, and writes an editable limits file |
+| deploy         | deploys the limiter Worker, sets its guard secret, and applies those limits — the bucket is live before `init` exits  |
 
 It opens by telling you to commit first, and reports whether your working tree is
 clean, because everything after that is easiest to read as a diff. Nothing is
@@ -277,30 +309,53 @@ Anything it could not do ends up in a "still to do" list with the exact command.
 
 `configure` is a method on the Durable Object, so **only a deployed Worker can
 call it** — no `wrangler` command reaches a DO method. `init` therefore offers to
-give the limiter Worker a key-guarded route, and to put your limits beside it as
-code:
+give the limiter Worker a key-guarded route, and to put your limits in a file
+beside it:
 
-```ts
-// durable-rate-limiter/src/limits.ts — one entry per upstream limit
-export const LIMITS: Record<string, Partial<LimiterConfig>> = {
-  'read-api': {
-    bucket: { capacity: 12, fillPerWindow: 48, windowInMs: 60_000 },
-    concurrency: 5,
+```jsonc
+// durable-rate-limiter/durable-rate-limiter.limits.jsonc
+// One entry per upstream limit. NOT read at runtime — see below.
+{
+  "limits": {
+    "read-api": {
+      "bucket": { "capacity": 12, "fillPerWindow": 48, "windowInMs": 60000 },
+      "concurrency": 5,
+    },
+    "write-api": {
+      "bucket": { "capacity": 6, "fillPerWindow": 24, "windowInMs": 60000 },
+      "concurrency": 2,
+    },
   },
-  'write-api': {
-    bucket: { capacity: 6, fillPerWindow: 24, windowInMs: 60_000 },
-    concurrency: 2,
-  },
-};
+}
 ```
 
-The limits then live in version control, change in a reviewable diff, and are
-applied by two commands:
+**This file is never deployed and the limiter Worker never imports it.** The
+limits are durable state inside the Durable Object; this is the copy you keep in
+version control, and `configure` is what carries one to the other. That is the
+whole reason it is JSONC rather than TypeScript — a TypeScript file would have to
+be imported by the Worker, which would make every limit change a code change and
+every code change a deploy.
+
+So the limits still live in version control and still change in a reviewable
+diff, but retuning one costs a single command:
 
 ```sh
-npx @bakidev/durable-rate-limiter configure   # deploy the limiter Worker, then apply LIMITS
-npx @bakidev/durable-rate-limiter stats       # read every bucket's live state back
+npx @bakidev/durable-rate-limiter configure     # upload the file — no deploy
+npx @bakidev/durable-rate-limiter stats         # read every bucket's live state back
+npx @bakidev/durable-rate-limiter stats --save  # ...and overwrite the file with it
+npx @bakidev/durable-rate-limiter sample        # write an example file to start from
 ```
+
+`stats` needs no list of names: the object keeps a registry of every bucket that
+has been configured, because a Durable Object namespace cannot be enumerated —
+there is no `list()`, and `idFromName` does not run backwards. `stats --save` is
+therefore the way to get an accurate limits file for a limiter you inherited, or
+to recover one you lost.
+
+Redeploy the limiter Worker only when **its own code** changes — a package
+upgrade, an edit to its `index.ts`. Never for a limit. If you point a current CLI
+at a Worker deployed before this arrangement existed, `configure` notices it
+ignored the upload and tells you to redeploy once.
 
 Both routes are guarded by a `DRL_CONFIG_KEY` secret and **deny everything while it
 is unset** — an unset secret means denied, never open. `init` generates a key,
@@ -321,9 +376,13 @@ npx wrangler secret put DRL_CONFIG_KEY --config durable-rate-limiter/wrangler.js
 
 `init` leaves a `.durable-rate-limiter.jsonc` **inside the limiter's own folder**
 — your project root gains one directory and nothing else. It records the Worker
-name, its config, where the limits live and the deployed URL; no secrets, so
+name, its config, where the limits file is and the deployed URL; no secrets, so
 commit it. Every path in it is relative to that folder, and `configure`/`stats`
 find it from anywhere in the project, so they work from a subdirectory too.
+
+The two files are deliberately separate. That one is written by the CLI and
+rewritten without warning; the limits file is written once and never touched
+again, so a comment explaining why a limit is what it is survives.
 
 Decline the route and `init` writes a `configureLimiter(env)` module instead, for
 you to call from a deploy script, an admin route, or a guarded first-run path.
@@ -718,6 +777,19 @@ carrying `attempts`, `limiter` and the original transport message as `cause`.
 Unlike the errors thrown inside the object, this one never crosses an RPC
 boundary, so its properties actually survive to be read.
 
+**A limiter that does not exist is not a drop.** Both failures arrive the same
+way — a rejection from the object before the callback ever fired — so the client
+has to tell them apart, and it does: a bucket that was never configured rejects
+with `NoSuchLimiterError` on the _first_ attempt, with no retries and no `onDrop`
+events. Retrying could not make it exist, and counting it as a drop would poison
+the one number you have for sizing real drops. It is almost always a mistyped
+instance name; `error.limiter` says which.
+
+The two are distinguished by a marker in the error message rather than its type,
+because nothing else survives: an error thrown inside a Durable Object reaches
+the caller as a plain `Error` with `name === 'Error'` and every custom property
+stripped. `instanceof` does not work across that boundary.
+
 `onDrop` fires on **every** drop, retried or not. The drop rate is a property of
 _your_ deployment — object churn, redeploy cadence, how long your callers park —
 not of the measurements above, so it has to be observable in production rather
@@ -900,29 +972,40 @@ does exactly that.
 | `limiter.for(env)`             | Per-request bind. Where the binding's presence is checked.         |
 | `bound.call(fn, options)`      | Runs `fn` under the shared limiter; returns what `read` extracted. |
 | `CallDroppedError`             | Every drop retry spent and the callback never ran.                 |
+| `NoSuchLimiterError`           | The bucket was never configured. Thrown at once, never retried.    |
 | `DEFAULT_DROP_RETRIES`         | `5`.                                                               |
 
 Types: `Binder`, `Limiter`, `BoundLimiter`, `LimiterDefinition`, `CallOptions`,
 `DropEvent`, `DropHook`, `RateLimitHook`, `RateLimitSignal`, `ErrorHook`,
 `FailureDescription`, `HookSlot`, `CallReport`, `LimiterStub`, `NamespaceLike`,
-`DoBindings`, `ENVELOPE_VERSION`.
+`DoBindings`, `ENVELOPE_VERSION`, plus `NO_SUCH_LIMITER` and `isNoSuchLimiter`
+— the shared marker that lets the client tell a missing bucket from a dropped
+caller across an RPC boundary that erases error types.
 
 ### `@bakidev/durable-rate-limiter/do`
 
-| Export                   | What it is                                                                |
-| ------------------------ | ------------------------------------------------------------------------- |
-| `LimiterDO`              | The Durable Object. Re-export it from your limiter Worker.                |
-| `LimiterEntrypoint`      | The named `WorkerEntrypoint` RPC surface.                                 |
-| `DEFAULT_LIMITER_CONFIG` | `{ capacity: 10, fillPerWindow: 50, windowInMs: 60_000 }`, concurrency 5. |
-| `CallFailedError`        | The rejection a reported failure becomes once it is final.                |
-| `ENVELOPE_VERSION`       | Compare against `ping()` to catch skew.                                   |
+| Export                      | What it is                                                                                                                                                                                                                                                    |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LimiterDO`                 | The Durable Object. Re-export it from your limiter Worker.                                                                                                                                                                                                    |
+| `LimiterEntrypoint`         | The named `WorkerEntrypoint` RPC surface.                                                                                                                                                                                                                     |
+| `LimiterNotConfiguredError` | What `execute`, `stats` and `reconfigure` throw on a bucket that was never configured — which is to say, one that does not exist. There is deliberately no default config to fall back on. Consumers going through `call()` see `NoSuchLimiterError` instead. |
+| `REGISTRY_NAME`             | The reserved instance holding every bucket's name. Your limiter Worker's `/stats` route needs it; nothing else should address it.                                                                                                                             |
+| `CallFailedError`           | The rejection a reported failure becomes once it is final.                                                                                                                                                                                                    |
+| `ENVELOPE_VERSION`          | Compare against `ping()` to catch skew.                                                                                                                                                                                                                       |
 
 Types: `LimiterConfig`, `LimiterStats`, `LimiterEnv`, `LimiterService`,
 `LimiterRpc`, `LimiterPing`, `CallReport`.
 
-`LimiterDO` methods: `execute(fn)`, `configure(patch)`, `stats()`.
-`LimiterEntrypoint` takes the instance name first: `execute(name, fn)`,
-`configure(name, patch)`, `stats(name)`, plus `ping()`.
+`LimiterDO` methods: `execute(fn)`, `configure(name, config)`,
+`reconfigure(patch)`, `stats()`, `listNames()`. `LimiterEntrypoint` takes the
+instance name first: `execute(name, fn)`, `configure(name, config)`,
+`reconfigure(name, patch)`, `stats(name)`, plus `listNames()` and `ping()`.
+
+`configure` creates and takes a **complete** config; `reconfigure` patches one
+that already exists. Only `configure` carries the name, because a Durable Object
+cannot recover the name it was addressed by — `ctx.id.name` is `undefined`
+inside one — and it needs one to enter the registry `listNames()` reads. A
+modification has nothing to register, so it needs no name.
 
 ---
 

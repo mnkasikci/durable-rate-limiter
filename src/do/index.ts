@@ -15,7 +15,10 @@ export {
 } from '../core/index.js';
 export {
   LimiterDO,
-  DEFAULT_LIMITER_CONFIG,
+  LimiterNotConfiguredError,
+  // The reserved instance holding every bucket's name. A limiter Worker's own
+  // /stats route needs it; nothing else should address it.
+  REGISTRY_NAME,
   createEnvelopeClassifier,
   envelopeRetryDelay,
   type LimiterConfig,

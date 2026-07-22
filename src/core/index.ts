@@ -3,6 +3,8 @@
 // testable and deterministic.
 export {
   ENVELOPE_VERSION,
+  NO_SUCH_LIMITER,
+  isNoSuchLimiter,
   type EnvelopeVersion,
   type CallReport,
 } from './envelope.js';

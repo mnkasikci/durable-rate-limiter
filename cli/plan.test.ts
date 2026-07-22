@@ -12,7 +12,10 @@ import {
   limiterModuleSource,
   limiterWorkerSource,
   limiterWranglerConfig,
-  limitsModuleSource,
+  limitsFileSource,
+  limitsPayload,
+  parseLimits,
+  sampleLimitsFileSource,
   sizeBucket,
   toIdentifier,
 } from './plan.js';
@@ -129,28 +132,132 @@ describe('the limiter Worker', () => {
     expect(source).toContain("new Response('unauthorized', { status: 401 })");
   });
 
-  it('configures only on /configure, and always reports stats', () => {
+  it('takes its limits from the request, not from its own bundle', () => {
+    // The whole point of the arrangement: nothing the Worker imports holds a
+    // limit, so a limit can change without the Worker being rebuilt.
     const source = limiterWorkerSource({ configRoute: true });
-    expect(source).toContain('if (configuring) await stub.configure(config);');
-    expect(source).toContain('result[name] = await stub.stats();');
+    expect(source).not.toContain("from './limits.js'");
+    expect(source).toContain('await request.json()');
+    expect(source).toContain('.configure(name, config)');
   });
 
-  it('writes one limits entry per bucket', () => {
-    const source = limitsModuleSource([
-      {
-        name: 'read-api',
-        bucket: { capacity: 12, fillPerWindow: 48, windowInMs: 60_000 },
-        concurrency: 5,
-      },
-      {
-        name: 'write-api',
-        bucket: { capacity: 6, fillPerWindow: 24, windowInMs: 60_000 },
-        concurrency: 2,
-      },
-    ]);
-    expect(source).toContain("'read-api': {");
-    expect(source).toContain("'write-api': {");
-    expect(source).toContain('fillPerWindow: 24');
+  it('refuses a GET on /configure, so a stale build cannot answer one', () => {
+    const source = limiterWorkerSource({ configRoute: true });
+    expect(source).toContain("request.method !== 'POST'");
+    expect(source).toContain("new Response('POST required', { status: 405 })");
+  });
+
+  it('asks the registry which buckets exist rather than being told', () => {
+    const source = limiterWorkerSource({ configRoute: true });
+    expect(source).toContain('stubFor(env, REGISTRY_NAME)');
+    expect(source).toContain('registry.listNames()');
+  });
+
+  it('prunes a listed name with no bucket behind it while reading', () => {
+    // Repair on the read path, which is what makes the registry converge after
+    // a creation that failed between registering and configuring.
+    const source = limiterWorkerSource({ configRoute: true });
+    expect(source).toContain('registry.unregisterName(name)');
+  });
+});
+
+describe('the limits file', () => {
+  const entries = [
+    {
+      name: 'read-api',
+      bucket: { capacity: 12, fillPerWindow: 48, windowInMs: 60_000 },
+      concurrency: 5,
+    },
+    {
+      name: 'write-api',
+      bucket: { capacity: 6, fillPerWindow: 24, windowInMs: 60_000 },
+      concurrency: 2,
+    },
+  ];
+
+  it('round-trips what it was given', () => {
+    // The generator and the parser are the two ends of the same wire. If they
+    // ever disagree, `stats --save` writes a file `configure` cannot read.
+    const parsed = parseLimits(limitsFileSource(entries));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+
+    expect(parsed.file.entries).toHaveLength(2);
+    expect(parsed.file.entries[0]).toMatchObject(entries[0] ?? {});
+    expect(parsed.file.source).toBeUndefined();
+  });
+
+  it('says plainly that it is not read at runtime', () => {
+    const source = limitsFileSource(entries);
+    expect(source).toContain('NOT read at runtime');
+    expect(source).toContain('No redeploy');
+  });
+
+  it('marks the sample as a sample, in the file and not only in a comment', () => {
+    // A header comment cannot stop `configure`. The parsed marker can.
+    const parsed = parseLimits(sampleLimitsFileSource());
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.file.source).toBe('sample');
+  });
+
+  it('survives the comments it exists to carry', () => {
+    const edited = limitsFileSource(entries).replace(
+      '"concurrency": 5',
+      '// upstream said 5 was the ceiling, 2024-11\n      "concurrency": 5'
+    );
+    const parsed = parseLimits(edited);
+    expect(parsed.ok).toBe(true);
+  });
+
+  it('collects every problem rather than only the first', () => {
+    const parsed = parseLimits(`{
+      "limits": {
+        "good": { "bucket": { "capacity": 1, "fillPerWindow": 1, "windowInMs": 1 }, "concurrency": 0 },
+        "also-bad": { "bucket": { "capacity": 0, "fillPerWindow": 1, "windowInMs": 1 }, "concurrency": 1 }
+      }
+    }`);
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.problems).toHaveLength(2);
+    expect(parsed.problems[0]).toContain('concurrency');
+    expect(parsed.problems[1]).toContain('capacity');
+  });
+
+  it('rejects a file with nothing in it to apply', () => {
+    expect(parseLimits('{ "limits": {} }')).toMatchObject({ ok: false });
+    expect(parseLimits('{}')).toMatchObject({ ok: false });
+    expect(parseLimits('[]')).toMatchObject({ ok: false });
+    expect(parseLimits('not json')).toMatchObject({ ok: false });
+  });
+
+  it('rejects an entry shaped wrongly rather than guessing at it', () => {
+    expect(parseLimits('{ "limits": { "a": 3 } }')).toMatchObject({
+      ok: false,
+    });
+    expect(parseLimits('{ "limits": { "a": {} } }')).toMatchObject({
+      ok: false,
+    });
+    expect(
+      parseLimits(
+        '{ "limits": { " bad name": { "bucket": { "capacity": 1, "fillPerWindow": 1, "windowInMs": 1 }, "concurrency": 1 } } }'
+      )
+    ).toMatchObject({ ok: false });
+    expect(
+      parseLimits(
+        '{ "limits": { "a": { "bucket": { "capacity": 1, "fillPerWindow": 1, "windowInMs": 1 }, "concurrency": 1, "retry": 9 } } }'
+      )
+    ).toMatchObject({ ok: false });
+  });
+
+  it('sends the object what it expects, keyed by name', () => {
+    const payload = limitsPayload(entries);
+    expect(Object.keys(payload)).toEqual(['read-api', 'write-api']);
+    expect(payload['read-api']).toMatchObject({
+      bucket: { capacity: 12 },
+      concurrency: 5,
+      retry: { maxRetries: 3 },
+    });
   });
 });
 

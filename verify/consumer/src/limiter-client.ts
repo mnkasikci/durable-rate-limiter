@@ -46,7 +46,8 @@ export function parseVia(raw: string | null): Via {
  */
 export interface LimiterAdmin {
   execute<T>(fn: () => Promise<CallReport<T>>): Promise<T>;
-  configure(config: Partial<LimiterConfig>): Promise<void>;
+  /** Complete, not a patch — the object has no default to merge one onto. */
+  configure(config: LimiterConfig): Promise<void>;
   stats(): Promise<LimiterStats>;
 }
 
@@ -59,7 +60,15 @@ export function limiterFor(env: Env, via: Via, name: string): LimiterAdmin {
     const stub: LimiterRpc = env.RATE_LIMITER.get(
       env.RATE_LIMITER.idFromName(name)
     );
-    return stub;
+    return {
+      execute: <T>(fn: () => Promise<CallReport<T>>) => stub.execute(fn),
+      stats: () => stub.stats(),
+      // The name goes in as well as being used to address the stub: a Durable
+      // Object cannot recover the name it was reached by, and it needs one to
+      // enter the registry `listNames` reads. `LimiterEntrypoint` does the
+      // same thing on the other branch.
+      configure: (config: LimiterConfig) => stub.configure(name, config),
+    };
   }
 
   const service = env.LIMITER;
@@ -67,7 +76,7 @@ export function limiterFor(env: Env, via: Via, name: string): LimiterAdmin {
     execute<T>(fn: () => Promise<CallReport<T>>): Promise<T> {
       return service.execute(name, fn);
     },
-    configure(config: Partial<LimiterConfig>): Promise<void> {
+    configure(config: LimiterConfig): Promise<void> {
       return service.configure(name, config);
     },
     stats(): Promise<LimiterStats> {

@@ -17,6 +17,10 @@ import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 
+import { stripJsonComments } from './plan.js';
+
+export { stripJsonComments };
+
 export const STATE_FILE = '.durable-rate-limiter.jsonc';
 
 export interface ProjectState {
@@ -24,7 +28,10 @@ export interface ProjectState {
   workerName: string;
   /** Its wrangler config, relative to the directory holding this file. */
   limiterConfig: string;
-  /** Where the declared limits live, relative to that same directory. */
+  /**
+   * The editable limits file, relative to that same directory. It is an input
+   * to `configure` and nothing else — never deployed, never read at runtime.
+   */
   limitsFile: string;
   /** Its deployed origin, when `init` managed to learn it. */
   url?: string;
@@ -40,8 +47,12 @@ const HEADER = `// Written by \`durable-rate-limiter init\`. Commit this — it 
 //
 // Do not delete it if you want these to keep working:
 //
-//   npx @bakidev/durable-rate-limiter configure   apply the limits in limits.ts
+//   npx @bakidev/durable-rate-limiter configure   upload the limits file
 //   npx @bakidev/durable-rate-limiter stats       read every bucket back
+//
+// This file is written by the CLI and rewritten without warning — put nothing
+// here you want to keep. Your limits go in the file "limitsFile" names below,
+// which the CLI writes once and never touches again.
 //
 // Every path below is relative to this file's directory.
 `;
@@ -151,65 +162,4 @@ export function endpoint(
   base.pathname = `/${route}`;
   base.searchParams.set('key', key);
   return base.toString();
-}
-
-/**
- * Comments out of JSONC, so the file can explain itself and still parse.
- *
- * String-aware, because a `//` inside a URL is not a comment and neither is one
- * inside an escaped quote — the two cases that make the naive regex version
- * silently corrupt a config.
- */
-export function stripJsonComments(source: string): string {
-  let output = '';
-  let index = 0;
-  let inString = false;
-
-  while (index < source.length) {
-    // Indexing past the end is impossible inside the loop condition, but the
-    // types do not know that and the `?? ''` costs nothing.
-    const char = source[index] ?? '';
-    const next = source[index + 1];
-
-    if (inString) {
-      output += char;
-      if (char === '\\') {
-        output += next ?? '';
-        index += 2;
-        continue;
-      }
-      if (char === '"') inString = false;
-      index += 1;
-      continue;
-    }
-
-    if (char === '"') {
-      inString = true;
-      output += char;
-      index += 1;
-      continue;
-    }
-
-    if (char === '/' && next === '/') {
-      while (index < source.length && source[index] !== '\n') index += 1;
-      continue;
-    }
-
-    if (char === '/' && next === '*') {
-      index += 2;
-      while (
-        index < source.length &&
-        !(source[index] === '*' && source[index + 1] === '/')
-      ) {
-        index += 1;
-      }
-      index += 2;
-      continue;
-    }
-
-    output += char;
-    index += 1;
-  }
-
-  return output;
 }

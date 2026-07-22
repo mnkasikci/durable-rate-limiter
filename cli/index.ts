@@ -5,7 +5,7 @@
 import { createRequire } from 'node:module';
 
 import { init } from './init.js';
-import { remote } from './remote.js';
+import { remote, sample } from './remote.js';
 import { Cancelled, bold, cyan, dim, red, say } from './prompt.js';
 
 const HELP = `${bold('durable-rate-limiter')} — setup for @bakidev/durable-rate-limiter
@@ -16,12 +16,17 @@ ${bold('Usage')}
 ${bold('Commands')}
   init            Scaffold the limiter Worker, add the binding, write the
                   limiter module, and size the bucket against your upstream.
-  configure       Deploy the limiter Worker and apply the limits declared in
-                  its limits.ts. Run this after editing them.
+  configure       Upload the limits file to the limiter. Run this after editing
+                  it. Deploys nothing — the limits are not part of the build.
   stats           Read every bucket's live state back.
+  sample          Write an example limits file, so the shape is visible before
+                  it is real. Touches nothing else.
 
 ${bold('Options')}
-  -y, --yes       Take every default without asking. Never deploys.
+  -y, --yes       Take every default without asking. Never deploys, and never
+                  applies an unedited sample.
+      --save      With ${cyan('stats')}: write the live limits over the limits file.
+                  The way to get an accurate one for a limiter you inherited.
   -h, --help      Show this.
   -v, --version   Print the package version.
 
@@ -50,9 +55,11 @@ export async function main(argv: string[]): Promise<number> {
   const options = {
     cwd: process.cwd(),
     assumeYes: flags.has('-y') || flags.has('--yes'),
+    save: flags.has('--save'),
   };
 
   if (command === undefined || command === 'init') return init(options);
+  if (command === 'sample') return sample(options);
   if (command === 'configure' || command === 'stats') {
     return remote(command, options);
   }

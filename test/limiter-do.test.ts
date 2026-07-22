@@ -6,7 +6,7 @@ import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 
 import {
-  DEFAULT_LIMITER_CONFIG,
+  REGISTRY_NAME,
   envelopeRetryDelay,
   type CallReport,
   type LimiterConfig,
@@ -16,6 +16,7 @@ import {
 import {
   BucketDestroyedError,
   DEFAULT_RETRY_OPTIONS,
+  isNoSuchLimiter,
   type BucketState,
   type RetryContext,
 } from '../src/core/index.js';
@@ -31,16 +32,40 @@ function stubFor(name: string): DurableObjectStub<LimiterDO> {
 }
 
 /**
+ * A stub with its own name bound into `configure`, exactly as
+ * `LimiterEntrypoint` binds it — the object cannot recover the name it was
+ * addressed by, so somebody has to carry it, and here that is this helper
+ * rather than thirty call sites repeating themselves.
+ */
+type NamedLimiter = Omit<LimiterRpc, 'configure'> & {
+  configure(config: LimiterConfig): Promise<void>;
+};
+
+/**
  * The same widening a consumer makes when it takes the `script_name` escape
  * hatch and binds the object directly: RPC erases the generics, so `execute`
  * is `never` on the raw stub type.
  */
-function limiter(name: string): LimiterRpc {
-  return stubFor(name);
+function limiter(name: string): NamedLimiter {
+  const stub: LimiterRpc = stubFor(name);
+  return {
+    execute: <T>(fn: () => Promise<CallReport<T>>) => stub.execute(fn),
+    stats: () => stub.stats(),
+    listNames: () => stub.listNames(),
+    registerName: (recorded: string) => stub.registerName(recorded),
+    unregisterName: (recorded: string) => stub.unregisterName(recorded),
+    reconfigure: (patch: Partial<LimiterConfig>) => stub.reconfigure(patch),
+    configure: (config: LimiterConfig) => stub.configure(name, config),
+  };
 }
 
-/** A limiter with room to spare, so a test measures what it means to measure. */
-function roomy(patch: Partial<LimiterConfig> = {}): Partial<LimiterConfig> {
+/**
+ * A limiter with room to spare, so a test measures what it means to measure.
+ *
+ * Complete rather than partial: `configure` takes a whole config, because there
+ * is no default to merge a fragment onto.
+ */
+function roomy(patch: Partial<LimiterConfig> = {}): LimiterConfig {
   return {
     bucket: { capacity: 50, fillPerWindow: 5000, windowInMs: 60_000 },
     concurrency: 5,
@@ -55,9 +80,29 @@ function ok<T>(value: T): CallReport<T> {
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Let the first `calls` writes through, then fail every one after.
+ *
+ * The only way to reach `configure`'s failure paths: a Durable Object's own
+ * storage does not fail on demand, and the half-written state those paths exist
+ * to clean up cannot be produced any other way.
+ */
+function breakWritesAfter(state: DurableObjectState, calls: number): void {
+  const original = state.storage.put.bind(state.storage);
+  let seen = 0;
+  (state.storage as unknown as { put: unknown }).put = async (
+    ...args: unknown[]
+  ): Promise<void> => {
+    seen += 1;
+    if (seen > calls) throw new Error('storage boom');
+    return (original as (...rest: unknown[]) => Promise<void>)(...args);
+  };
+}
+
 describe('LimiterDO.execute', () => {
   it('runs the callback and returns what it reported', async () => {
     const stub = limiter('execute-basic');
+    await stub.configure(roomy());
     await expect(stub.execute(async () => ok('hello'))).resolves.toBe('hello');
   });
 
@@ -66,6 +111,7 @@ describe('LimiterDO.execute', () => {
     // mutates a variable that exists only in this test's heap, and allocates a
     // buffer that never crosses the boundary — only its length does.
     const stub = limiter('execute-isolate');
+    await stub.configure(roomy());
     let ranHere = false;
 
     const size = await stub.execute(async () => {
@@ -339,7 +385,7 @@ describe('LimiterDO and the failure envelope', () => {
 describe('LimiterDO.configure', () => {
   it('persists limits so they survive eviction', async () => {
     const stub = limiter('configure-persist');
-    const config = roomy({ concurrency: 3 }) as LimiterConfig;
+    const config = roomy({ concurrency: 3 });
     await stub.configure(config);
 
     const stored = await runInDurableObject(
@@ -352,13 +398,26 @@ describe('LimiterDO.configure', () => {
     await expect(stub.stats()).resolves.toMatchObject({ config });
   });
 
-  it('merges a partial patch over the defaults', async () => {
+  it('merges a reconfigure patch over what is already in force', async () => {
     const stub = limiter('configure-merge');
-    await stub.configure({ concurrency: 1 });
+    const bucket = { capacity: 7, fillPerWindow: 11, windowInMs: 60_000 };
+    await stub.configure({ bucket, concurrency: 9 });
 
+    await stub.reconfigure({ concurrency: 1 });
+
+    // The untouched half survives, and it comes from the bucket's own previous
+    // config — there is no default for it to have come from.
     await expect(stub.stats()).resolves.toMatchObject({
-      config: { bucket: DEFAULT_LIMITER_CONFIG.bucket, concurrency: 1 },
+      config: { bucket, concurrency: 1 },
     });
+  });
+
+  it('refuses to patch a bucket that does not exist', async () => {
+    // The half-specified bucket `configure` will not create cannot be smuggled
+    // in through the back door either.
+    await expect(
+      limiter('configure-patch-nothing').reconfigure({ concurrency: 1 })
+    ).rejects.toThrow(/never been configured|No such limiter/);
   });
 
   it('rejects anyone queued on the limits being replaced', async () => {
@@ -384,9 +443,9 @@ describe('LimiterDO.configure', () => {
     await stub.configure(roomy({ concurrency: 4 }));
 
     await expect(
-      stub.configure({
-        bucket: { capacity: -1, fillPerWindow: 1, windowInMs: 1 },
-      })
+      stub.configure(
+        roomy({ bucket: { capacity: -1, fillPerWindow: 1, windowInMs: 1 } })
+      )
     ).rejects.toThrow(/capacity/);
 
     // Still usable on the last good config, rather than wedged on a written one.
@@ -475,8 +534,8 @@ describe('LimiterDO persistence', () => {
       });
     });
 
-    // configure() drops the cached runtime, forcing a restore from storage.
-    await stub.configure({ concurrency: 5 });
+    // reconfigure() drops the cached runtime, forcing a restore from storage.
+    await stub.reconfigure({ concurrency: 5 });
     const stats = await stub.stats();
     expect(stats.tokens).toBeGreaterThanOrEqual(2);
     expect(stats.tokens).toBeLessThan(3);
@@ -503,6 +562,214 @@ describe('LimiterDO persistence', () => {
     await expect(
       runInDurableObject(raw, async (instance: LimiterDO) => instance.stats())
     ).resolves.toMatchObject({ config: { concurrency: 5 } });
+  });
+});
+
+describe('LimiterDO registry', () => {
+  const registry = (): NamedLimiter => limiter(REGISTRY_NAME);
+
+  it('records a bucket when it is configured', async () => {
+    await limiter('registry-configured').configure(roomy());
+    expect(await registry().listNames()).toContain('registry-configured');
+  });
+
+  it('reports the name it was configured under', async () => {
+    // A stats blob that identifies itself. The object reads this from storage;
+    // it cannot get it from its own ID, which carries no name.
+    await limiter('registry-self-naming').configure(roomy());
+    await expect(
+      limiter('registry-self-naming').stats()
+    ).resolves.toMatchObject({ name: 'registry-self-naming' });
+  });
+
+  it('records a bucket once, however often it is restated', async () => {
+    const stub = limiter('registry-once');
+    await stub.configure(roomy());
+    await stub.configure(roomy({ concurrency: 2 }));
+    await stub.reconfigure({ concurrency: 3 });
+
+    const names = await registry().listNames();
+    expect(names.filter((name) => name === 'registry-once')).toHaveLength(1);
+  });
+
+  it('refuses to run a bucket nobody configured, and holds no storage', async () => {
+    // The whole reason the registry can be complete: a bucket that was never
+    // configured cannot run, so there is no such thing as a live bucket the
+    // registry has not heard of. A mistyped instance name lands here rather
+    // than silently becoming a second bucket at some plausible default rate.
+    await expect(
+      limiter('registry-never-configured').execute(async () => ok(1))
+    ).rejects.toThrow(/No such limiter/);
+    await expect(limiter('registry-never-configured').stats()).rejects.toThrow(
+      /No such limiter/
+    );
+    expect(await registry().listNames()).not.toContain(
+      'registry-never-configured'
+    );
+
+    // Unconfigured is not a state a bucket sits in — nothing was written, so
+    // the object is indistinguishable from one that was never addressed.
+    const written = await runInDurableObject(
+      stubFor('registry-never-configured'),
+      async (_i, state) => [...(await state.storage.list()).keys()]
+    );
+    expect(written).toEqual([]);
+  });
+
+  it('records nothing at all when the config is rejected', async () => {
+    // Creation is all-or-nothing. Validation runs before the registration, so
+    // a bad shape never reaches the registry — and even if it had, the object
+    // would have compensated and erased itself.
+    await expect(
+      limiter('registry-invalid').configure(
+        roomy({ bucket: { capacity: 0, fillPerWindow: 1, windowInMs: 1 } })
+      )
+    ).rejects.toThrow(/capacity/);
+
+    expect(await registry().listNames()).not.toContain('registry-invalid');
+    await expect(limiter('registry-invalid').stats()).rejects.toThrow(
+      /No such limiter/
+    );
+  });
+
+  it('re-registers itself from its own stored name when the list is damaged', async () => {
+    // The repair that makes the registry converge rather than stay wrong. The
+    // bucket knows its own name because `configure` persisted it, so it can
+    // reassert membership without anyone telling it who it is.
+    const stub = limiter('registry-repair');
+    await stub.configure(roomy());
+    await registry().unregisterName('registry-repair');
+    expect(await registry().listNames()).not.toContain('registry-repair');
+
+    // Force a fresh object lifetime, which is where the reassertion fires.
+    await stub.reconfigure({ concurrency: 4 });
+    await stub.execute(async () => ok(1));
+
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if ((await registry().listNames()).includes('registry-repair')) break;
+      await sleep(10);
+    }
+    expect(await registry().listNames()).toContain('registry-repair');
+  });
+
+  it('forgets a name on request, and shrugs at one it never held', async () => {
+    await limiter('registry-forget').configure(roomy());
+    expect(await registry().listNames()).toContain('registry-forget');
+
+    await registry().unregisterName('registry-forget');
+    expect(await registry().listNames()).not.toContain('registry-forget');
+
+    // Pruning is a read-path repair, so it runs against lists that may already
+    // be correct. Doing nothing has to be cheap and silent.
+    await registry().unregisterName('never-existed');
+    expect(await registry().listNames()).not.toContain('never-existed');
+  });
+
+  it('erases itself and un-registers when creation fails half-way', async () => {
+    // The saga's compensating half. Registration lands first so that the
+    // survivable failure is a name with no bucket, never a bucket with no name
+    // — and when the config write then fails on a bucket that did not exist a
+    // moment ago, neither half is allowed to survive.
+    const name = 'registry-torn-create';
+    await runInDurableObject(
+      stubFor(name),
+      async (instance: LimiterDO, state) => {
+        // The name lands, the config does not.
+        breakWritesAfter(state, 1);
+        await expect(instance.configure(name, roomy())).rejects.toThrow(
+          /storage boom/
+        );
+      }
+    );
+
+    expect(await registry().listNames()).not.toContain(name);
+    const written = await runInDurableObject(
+      stubFor(name),
+      async (_i, state) => [...(await state.storage.list()).keys()]
+    );
+    expect(written).toEqual([]);
+  });
+
+  it('leaves a live bucket untouched when a restatement fails', async () => {
+    // The erasure is for creation only. Wiping a bucket that is already pacing
+    // real traffic would hand out a full burst against someone else's quota on
+    // the next call, which is the failure this package exists to prevent.
+    const name = 'registry-torn-restate';
+    const stub = limiter(name);
+    await stub.configure(roomy({ concurrency: 3 }));
+
+    await runInDurableObject(
+      stubFor(name),
+      async (instance: LimiterDO, state) => {
+        breakWritesAfter(state, 1);
+        await expect(
+          instance.configure(name, roomy({ concurrency: 9 }))
+        ).rejects.toThrow(/storage boom/);
+      }
+    );
+
+    expect(await registry().listNames()).toContain(name);
+    // Still on the last good limits, and still usable.
+    await expect(stub.stats()).resolves.toMatchObject({
+      name,
+      config: { concurrency: 3 },
+    });
+  });
+
+  it('holds no name list on an instance that is not the registry', async () => {
+    // Both list operations have to cope with storage that has never held one.
+    const stranger = limiter('registry-stranger');
+    expect(await stranger.listNames()).toEqual([]);
+    await stranger.unregisterName('anything');
+    expect(await stranger.listNames()).toEqual([]);
+  });
+
+  it('never fails a caller because the registry was unreachable', async () => {
+    // Re-registration is bookkeeping. It happens on the restore path, which is
+    // the same path a real call takes, so if it were allowed to throw it would
+    // turn a damaged registry into failed requests against the upstream.
+    const name = 'registry-unreachable';
+    const stub = limiter(name);
+    await stub.configure(roomy());
+
+    const saved = await registry().listNames();
+    // A number, not a string: `'...'.includes` would work fine, and the point
+    // is to make the registry's own write throw.
+    await runInDurableObject(stubFor(REGISTRY_NAME), async (_i, state) => {
+      await state.storage.put('names', 42);
+    });
+
+    // A fresh lifetime, so the re-registration fires — into a broken registry.
+    await stub.reconfigure({ concurrency: 2 });
+    await expect(stub.execute(async () => ok('served'))).resolves.toBe(
+      'served'
+    );
+
+    await sleep(100);
+    await runInDurableObject(stubFor(REGISTRY_NAME), async (_i, state) => {
+      await state.storage.put('names', saved);
+    });
+  });
+
+  it('carries the no-such-limiter marker across a real RPC hop', async () => {
+    // The mechanism the client's whole classification rests on, pinned against
+    // the real boundary rather than a double. What arrives is a plain `Error`:
+    // the class is gone, `name` is 'Error', and every custom property has been
+    // stripped — so the marker has to be in the message, and this asserts it
+    // still is after a trip through workerd.
+    const arrived: unknown = await limiter('registry-marker')
+      .execute(async () => ok(1))
+      .catch((error: unknown) => error);
+
+    expect(arrived).toBeInstanceOf(Error);
+    expect((arrived as Error).name).toBe('Error');
+    expect(isNoSuchLimiter(arrived)).toBe(true);
+  });
+
+  it('keeps the list sorted and free of duplicates', async () => {
+    const names = await registry().listNames();
+    expect([...names].sort()).toEqual(names);
+    expect(new Set(names).size).toBe(names.length);
   });
 });
 

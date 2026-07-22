@@ -60,9 +60,20 @@ function uniqueName(prefix: string): string {
 
 describe('defineBinder', () => {
   it('reaches the real binding and runs the callback in this isolate', async () => {
+    const name = uniqueName('real');
+    // A limiter refuses to run until its limits exist, so the setup call the
+    // CLI would make has to happen here too.
+    await env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(name)).configure(
+      name,
+      {
+        bucket: { capacity: 50, fillPerWindow: 5000, windowInMs: 60_000 },
+        concurrency: 5,
+      }
+    );
+
     const limiter = defineLimiter({
       binder: defineBinder('RATE_LIMITER'),
-      name: uniqueName('real'),
+      name,
     });
 
     let ranHere = false;

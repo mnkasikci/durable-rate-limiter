@@ -7,11 +7,18 @@ import { describe, expect, it } from 'vitest';
 
 import {
   CallDroppedError,
+  NoSuchLimiterError,
   defineBinder,
   defineLimiter,
+  defineTestBinder,
 } from '../src/client/index.js';
 import type { BoundLimiter, DropEvent } from '../src/client/index.js';
-import type { LimiterConfig, LimiterDO, LimiterRpc } from '../src/do/index.js';
+import type {
+  CallReport,
+  LimiterConfig,
+  LimiterDO,
+  LimiterRpc,
+} from '../src/do/index.js';
 import type { BucketState } from '../src/core/index.js';
 
 /**
@@ -36,8 +43,28 @@ function uniqueName(prefix: string): string {
 }
 
 /** Raw stub for the same instance, for `configure`/`stats` — setup, not calls. */
-function control(name: string): LimiterRpc {
-  return env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(name));
+/**
+ * A stub with its own name bound into `configure`, the way
+ * `LimiterEntrypoint` binds it: a Durable Object cannot recover the name it
+ * was addressed by, so the caller carries it.
+ */
+type Control = Omit<LimiterRpc, 'configure'> & {
+  configure(config: LimiterConfig): Promise<void>;
+};
+
+function control(name: string): Control {
+  const stub: LimiterRpc = env.RATE_LIMITER.get(
+    env.RATE_LIMITER.idFromName(name)
+  );
+  return {
+    execute: <T>(fn: () => Promise<CallReport<T>>) => stub.execute(fn),
+    stats: () => stub.stats(),
+    listNames: () => stub.listNames(),
+    registerName: (recorded: string) => stub.registerName(recorded),
+    unregisterName: (recorded: string) => stub.unregisterName(recorded),
+    reconfigure: (patch: Partial<LimiterConfig>) => stub.reconfigure(patch),
+    configure: (config: LimiterConfig) => stub.configure(name, config),
+  };
 }
 
 function rawStub(name: string): DurableObjectStub<LimiterDO> {
@@ -52,7 +79,7 @@ function rawStub(name: string): DurableObjectStub<LimiterDO> {
  * every penalty expire before an assertion could see it. It stays generous
  * here, and the tests that only want a *fast* retry lower `minDelayInMs`.
  */
-function roomy(patch: Partial<LimiterConfig> = {}): Partial<LimiterConfig> {
+function roomy(patch: Partial<LimiterConfig> = {}): LimiterConfig {
   return {
     bucket: { capacity: 50, fillPerWindow: 5000, windowInMs: 60_000 },
     concurrency: 5,
@@ -68,9 +95,9 @@ function roomy(patch: Partial<LimiterConfig> = {}): Partial<LimiterConfig> {
  */
 async function setup(
   prefix: string,
-  config: Partial<LimiterConfig> = roomy(),
+  config: LimiterConfig = roomy(),
   definition: Partial<Parameters<typeof defineLimiter>[0]> = {}
-): Promise<{ name: string; bound: BoundLimiter; ctl: LimiterRpc }> {
+): Promise<{ name: string; bound: BoundLimiter; ctl: Control }> {
   const name = uniqueName(prefix);
   const ctl = control(name);
   await ctl.configure(config);
@@ -359,8 +386,8 @@ describe('client + object — durability and its limits', () => {
     expect(stored?.tokens).toBeCloseTo(8, 3);
 
     // What eviction looks like: state on disk, no runtime in memory.
-    // `configure` drops the cached runtime and forces a restore.
-    await ctl.configure({});
+    // `reconfigure` drops the cached runtime and forces a restore.
+    await ctl.reconfigure({});
     const restored = await ctl.stats();
     expect(restored.tokens).toBeGreaterThanOrEqual(8);
     expect(restored.tokens).toBeLessThan(9);
@@ -387,7 +414,7 @@ describe('client + object — durability and its limits', () => {
     await sleep(50);
 
     // Rebuilding the bucket destroys it, and every waiter on it.
-    await ctl.configure({ concurrency: 4 });
+    await ctl.reconfigure({ concurrency: 4 });
 
     await expect(parked).rejects.toThrow(CallDroppedError);
   });
@@ -424,7 +451,7 @@ describe('client + object — durability and its limits', () => {
 
     // Same destruction as above — but now the limits it re-queues under have
     // tokens, so the caller is served instead of being told to go away.
-    await ctl.configure({
+    await ctl.reconfigure({
       bucket: { capacity: 5, fillPerWindow: 5, windowInMs: 1_000 },
     });
 
@@ -435,5 +462,71 @@ describe('client + object — durability and its limits', () => {
     expect(drops).toHaveLength(1);
     expect(drops[0]?.willRetry).toBe(true);
     expect(drops[0]?.attempt).toBe(1);
+  });
+});
+
+describe('client + object — a limiter that does not exist', () => {
+  it('fails at once, and does not report a drop that never happened', async () => {
+    // Both failures reach the client the same way: a rejection from the object
+    // before the callback ever fired. Telling them apart is the point. A drop
+    // is transport and worth retrying; this is permanent, and retrying it would
+    // spend six round trips and put six phantom events into the one metric an
+    // operator has for sizing real drops.
+    const drops: DropEvent[] = [];
+    let callbackRuns = 0;
+
+    const limiter = defineLimiter({
+      binder,
+      name: uniqueName('never-configured'),
+      onDrop: (event) => drops.push(event),
+    });
+
+    const failure = await limiter
+      .for(env)
+      .call(
+        () => {
+          callbackRuns += 1;
+          return json({ ok: true });
+        },
+        { read: readJson }
+      )
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(NoSuchLimiterError);
+    expect(failure).not.toBeInstanceOf(CallDroppedError);
+    expect(drops).toEqual([]);
+    expect(callbackRuns).toBe(0);
+
+    const error = failure as NoSuchLimiterError;
+    expect(error.limiter).toBe(limiter.name);
+    // The remedy the object wrote is still reachable, one level down.
+    expect((error.cause as Error).message).toContain('mistyped instance name');
+  });
+
+  it('still retries a caller dropped in transit', async () => {
+    // The other half of the fork, so the fix cannot have turned every
+    // pre-callback failure into a permanent one.
+    const drops: DropEvent[] = [];
+    let attempts = 0;
+
+    const limiter = defineLimiter({
+      binder: defineTestBinder<string>({
+        idFromName: (name) => name,
+        get: () => ({
+          execute<T>(): Promise<T> {
+            attempts += 1;
+            return Promise.reject(new Error('Network connection lost.'));
+          },
+        }),
+      }),
+      name: 'dropped-not-missing',
+      onDrop: (event) => drops.push(event),
+    });
+
+    await expect(
+      limiter.for(env).call(() => json({ ok: true }), { read: readJson })
+    ).rejects.toBeInstanceOf(CallDroppedError);
+    expect(attempts).toBe(6);
+    expect(drops).toHaveLength(6);
   });
 });

@@ -22,6 +22,50 @@ export const ENVELOPE_VERSION = 1;
 export type EnvelopeVersion = typeof ENVELOPE_VERSION;
 
 /**
+ * The marker that says "this limiter does not exist", carried in an error
+ * MESSAGE because nothing else survives the trip.
+ *
+ * Measured, not assumed: an error thrown inside a Durable Object arrives at the
+ * caller as a plain `Error` with `name === 'Error'`. The class is gone,
+ * `instanceof` is useless, and every custom property has been stripped —
+ * `Object.keys` on the arrival is `['remote']`. The runtime does fold the
+ * original class name into the front of the message, but that is undocumented
+ * behaviour nobody has promised, so this token is written into the message
+ * explicitly rather than read out of the runtime's formatting.
+ *
+ * That makes it a wire contract, which is why it lives here beside
+ * {@link ENVELOPE_VERSION} and not in either half. The client must be able to
+ * tell a limiter that does not exist — permanent, and retrying it is pointless
+ * — from a caller dropped in transit, which is transient and must be retried.
+ * Those two arrive at exactly the same place, and this is the only thing that
+ * distinguishes them.
+ *
+ * Skew degrades in both directions: an older client against a newer object
+ * simply does not recognise the token and falls back to retrying, and a newer
+ * client against an older object never sees one.
+ */
+export const NO_SUCH_LIMITER = '[drl:no-such-limiter]';
+
+/**
+ * Whether a rejection is an object saying the limiter does not exist.
+ *
+ * Deliberately structural rather than a type check: see
+ * {@link NO_SUCH_LIMITER} for why `instanceof` cannot work here. Non-Error
+ * values are tolerated because a test double or a future runtime can throw one,
+ * and the answer for anything unrecognised is a safe `false` — treat it as
+ * transient, which costs a retry rather than a lost signal.
+ */
+export function isNoSuchLimiter(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : '';
+  return message.includes(NO_SUCH_LIMITER);
+}
+
+/**
  * What a caller hands back to the limiter after running its own work.
  *
  * An envelope rather than a `Response` is the whole design in one type. The

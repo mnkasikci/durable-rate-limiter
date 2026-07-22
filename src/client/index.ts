@@ -22,6 +22,7 @@ export {
 
 export {
   CallDroppedError,
+  NoSuchLimiterError,
   DEFAULT_DROP_RETRIES,
   type DropEvent,
   type DropHook,

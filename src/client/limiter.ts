@@ -22,11 +22,12 @@
  * unexplained 429s from an upstream nobody was over-calling.
  */
 
-import type { CallReport } from '../core/index.js';
+import { isNoSuchLimiter, type CallReport } from '../core/index.js';
 
 import type { Binder, LimiterStub } from './binder.js';
 import {
   CallDroppedError,
+  NoSuchLimiterError,
   DEFAULT_DROP_RETRIES,
   type DropHook,
 } from './dropped.js';
@@ -257,12 +258,28 @@ export function defineLimiter(definition: LimiterDefinition): Limiter {
               // nobody asked for.
               if (ran.fired) throw error;
 
-              // Everything below is a caller dropped before it ever ran. RPC
-              // reconstructs a thrown value as an Error, but a non-Error can
-              // still arrive from a test double or a future runtime, and the
-              // hook's contract says `error` is an Error.
+              // Everything below is a failure that reached the caller before
+              // its work ever started. RPC reconstructs a thrown value as an
+              // Error, but a non-Error can still arrive from a test double or a
+              // future runtime, and the hook's contract says `error` is an
+              // Error.
               const cause =
                 error instanceof Error ? error : new Error(String(error));
+
+              // The fork. A bucket that does not exist is permanent: retrying
+              // it cannot make it exist, and counting it as a drop would put
+              // six phantom events into the one metric an operator has for
+              // sizing real drops. It is almost always a mistyped instance
+              // name, so it is reported as itself rather than buried under a
+              // message about queueing.
+              //
+              // Matched on the message because nothing else survives: see
+              // NO_SUCH_LIMITER. Anything unrecognised falls through to the
+              // drop path, which costs a retry rather than a lost signal.
+              if (isNoSuchLimiter(cause)) {
+                throw new NoSuchLimiterError(definition.name, cause);
+              }
+
               const willRetry = attempt <= maxRetries;
 
               // Reported before the retry, not after: a hook that only fires

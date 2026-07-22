@@ -16,11 +16,13 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 import {
+  LIMITS_FILE,
   bindingFragment,
   configureModuleSource,
   hasTopLevelKey,
   insertFragment,
-  limitsModuleSource,
+  limitsFileSource,
+  limitsPayload,
   isValidBindingName,
   isValidConcurrency,
   isValidInstanceName,
@@ -411,16 +413,17 @@ export async function init(options: InitOptions): Promise<number> {
         `deploy the limiter Worker: npx wrangler deploy --config ${limiterConfigPath}`
       );
     } else {
-      const limitsPath = path.join(limiterRoot, 'src', 'limits.ts');
+      const entries = [{ name: instanceName, bucket, concurrency }];
+      const limitsPath = path.join(limiterRoot, LIMITS_FILE);
       if (
         await writeIfAllowed(
           prompter,
           cwd,
           limitsPath,
-          limitsModuleSource([{ name: instanceName, bucket, concurrency }])
+          limitsFileSource(entries)
         )
       ) {
-        done.push(`wrote ${rel(cwd, limitsPath)} — your limits, as code`);
+        done.push(`wrote ${rel(cwd, limitsPath)} — your limits, editable`);
       }
 
       // Inside the limiter's own folder, with paths relative to it — the
@@ -428,7 +431,7 @@ export async function init(options: InitOptions): Promise<number> {
       const state: ProjectState = {
         workerName,
         limiterConfig: 'wrangler.jsonc',
-        limitsFile: path.join('src', 'limits.ts'),
+        limitsFile: LIMITS_FILE,
       };
       await writeState(limiterRoot, state);
       done.push(`wrote ${rel(cwd, statePath(limiterRoot))}`);
@@ -437,8 +440,9 @@ export async function init(options: InitOptions): Promise<number> {
       heading('5. Deploy the limiter and apply the limits');
       say(
         dim(
-          'The limits are bundled into the limiter Worker, so they take effect\n' +
-            '  when it is deployed and /configure is called once. Both happen here.'
+          'The Worker is deployed once. The limits are uploaded separately, over\n' +
+            '  its /configure route — which is why changing one later costs a\n' +
+            '  `configure` and no deploy at all. Both happen here.'
         )
       );
 
@@ -512,7 +516,7 @@ export async function init(options: InitOptions): Promise<number> {
             todo.push(...applyByHand.slice(1));
           } else {
             done.push('set DRL_CONFIG_KEY on the limiter Worker');
-            const applied = await applyLimits(url, key);
+            const applied = await applyLimits(url, key, limitsPayload(entries));
             if (applied) done.push('applied the limits — the bucket is live');
             else
               todo.push(
@@ -521,12 +525,12 @@ export async function init(options: InitOptions): Promise<number> {
           }
 
           say();
-          say(dim('  To re-apply after editing limits.ts:'));
+          say(dim(`  To change a limit: edit ${LIMITS_FILE}, then:`));
           say(
-            `    ${cyan('npx @bakidev/durable-rate-limiter configure')}   ${dim('(deploys, then applies)')}`
+            `    ${cyan('npx @bakidev/durable-rate-limiter configure')}   ${dim('(uploads it — no redeploy)')}`
           );
           say(
-            `    ${cyan('npx @bakidev/durable-rate-limiter stats')}       ${dim('(reads them back)')}`
+            `    ${cyan('npx @bakidev/durable-rate-limiter stats')}       ${dim('(reads every bucket back)')}`
           );
           say();
           sayKeyRecovery(workerName, limiterConfigPath);
@@ -675,12 +679,19 @@ function generateKey(): string {
 }
 
 /** Applies the declared limits through the Worker's own guarded route. */
-async function applyLimits(url: string, key: string): Promise<boolean> {
+async function applyLimits(
+  url: string,
+  key: string,
+  limits: unknown
+): Promise<boolean> {
   say();
   say(dim('  applying the limits…'));
 
   try {
-    const response = await fetch(endpoint(url, 'configure', key));
+    const response = await fetch(endpoint(url, 'configure', key), {
+      method: 'POST',
+      body: JSON.stringify(limits),
+    });
     if (!response.ok) {
       say(red(`  /configure returned ${String(response.status)}`));
       return false;

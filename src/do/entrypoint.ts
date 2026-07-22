@@ -2,6 +2,7 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 
 import { ENVELOPE_VERSION, type CallReport } from '../core/index.js';
 
+import { REGISTRY_NAME } from './limiter-do.js';
 import type { LimiterConfig, LimiterDO, LimiterStats } from './limiter-do.js';
 
 /**
@@ -35,15 +36,31 @@ export interface LimiterPing {
  */
 export interface LimiterRpc {
   execute<T>(fn: () => Promise<CallReport<T>>): Promise<T>;
-  configure(config: Partial<LimiterConfig>): Promise<void>;
+  /**
+   * Create or restate a bucket, with a COMPLETE config — there is no default to
+   * merge onto. `name` is the one the caller addressed this stub by: the object
+   * cannot recover it, since `ctx.id.name` is `undefined` inside a Durable
+   * Object, and it needs one to enter the registry.
+   */
+  configure(name: string, config: LimiterConfig): Promise<void>;
+  /** Patch an existing bucket. Throws if there is nothing to patch. */
+  reconfigure(patch: Partial<LimiterConfig>): Promise<void>;
   stats(): Promise<LimiterStats>;
+  /** Registry-only. Called by a bucket about itself, never by a consumer. */
+  registerName(name: string): Promise<void>;
+  /** Registry-only. The repair for a listed name with no bucket behind it. */
+  unregisterName(name: string): Promise<void>;
+  /** Registry-only. Every bucket name this namespace has served. */
+  listNames(): Promise<string[]>;
 }
 
 /** The same, for the service binding. What a consumer's binding should be typed as. */
 export interface LimiterService {
   execute<T>(name: string, fn: () => Promise<CallReport<T>>): Promise<T>;
-  configure(name: string, config: Partial<LimiterConfig>): Promise<void>;
+  configure(name: string, config: LimiterConfig): Promise<void>;
+  reconfigure(name: string, patch: Partial<LimiterConfig>): Promise<void>;
   stats(name: string): Promise<LimiterStats>;
+  listNames(): Promise<string[]>;
   ping(): Promise<LimiterPing>;
 }
 
@@ -86,7 +103,7 @@ export class LimiterEntrypoint
     // `execute` as `never`, and widening it here is what stops that `never`
     // reaching consumers. No cast is needed, precisely because `never` is
     // assignable to anything — which is also why the erasure is so quiet.
-    return this.env.RATE_LIMITER.get(this.env.RATE_LIMITER.idFromName(name));
+    return this.env.RATE_LIMITER.getByName(name);
   }
 
   /** Schedule `fn` against the limiter called `name`. */
@@ -94,14 +111,37 @@ export class LimiterEntrypoint
     return this.#stub(name).execute(fn);
   }
 
-  /** Set the limits for one named limiter. A setup call, not a per-request one. */
-  configure(name: string, config: Partial<LimiterConfig>): Promise<void> {
-    return this.#stub(name).configure(config);
+  /**
+   * Create one named limiter, or restate it, with a COMPLETE set of limits — a
+   * bucket that has never been configured does not exist and refuses to
+   * `execute`, rather than inventing a rate. A setup call, not a per-request
+   * one.
+   */
+  configure(name: string, config: LimiterConfig): Promise<void> {
+    return this.#stub(name).configure(name, config);
+  }
+
+  /**
+   * Adjust one that already exists. No name reaches the object: an existing
+   * bucket is already registered, so a modification has nothing to record.
+   */
+  reconfigure(name: string, patch: Partial<LimiterConfig>): Promise<void> {
+    return this.#stub(name).reconfigure(patch);
   }
 
   /** Live tokens, penalty state and the raw persisted triple. */
   stats(name: string): Promise<LimiterStats> {
     return this.#stub(name).stats();
+  }
+
+  /**
+   * Every bucket name in use — the one question that cannot be answered by
+   * addressing a bucket, since a namespace has no `list()` and `idFromName` is
+   * one-way. It is answered by the reserved registry instance, which each
+   * bucket enters when it is configured.
+   */
+  listNames(): Promise<string[]> {
+    return this.#stub(REGISTRY_NAME).listNames();
   }
 
   /**

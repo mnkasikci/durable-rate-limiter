@@ -102,6 +102,41 @@ export class CallDroppedError extends Error {
 }
 
 /**
+ * The limiter a caller asked for does not exist.
+ *
+ * Lives beside {@link CallDroppedError} because the two are the outcomes of one
+ * fork. Both arrive the same way — a rejection from the object *before* the
+ * callback ever fired — and telling them apart is the whole job: a drop is
+ * transport, transient, and worth retrying; this is permanent, and retrying it
+ * six times only wastes round trips, lies to `onDrop` about a drop that never
+ * happened, and buries the real remedy under a message about queueing.
+ *
+ * Almost always a mistyped instance name. A typo is not an error anywhere else
+ * in this system — it simply names a different bucket — so this is the point at
+ * which it becomes visible, and it is worth making that moment legible.
+ *
+ * A real class with real properties, like `CallDroppedError` and unlike the
+ * errors on the object side: it is constructed in the caller's own isolate and
+ * never crosses an RPC boundary, so `limiter` survives to be read.
+ */
+export class NoSuchLimiterError extends Error {
+  /** The instance name that resolved to nothing. */
+  readonly limiter: string;
+
+  constructor(limiter: string, cause: Error) {
+    super(
+      `limiter "${limiter}" does not exist: it has never been configured. ` +
+        'That is usually a mistyped instance name — it is not an error to ' +
+        'name a bucket nobody set up, it is simply a different bucket. ' +
+        'Configure it, or check the name against `listNames()`.',
+      { cause }
+    );
+    this.name = 'NoSuchLimiterError';
+    this.limiter = limiter;
+  }
+}
+
+/**
  * Attempts after the first, so six in total.
  *
  * Higher than the object's own retry budget of 3, because these attempts are

@@ -15,7 +15,7 @@ import {
 const STATE: ProjectState = {
   workerName: 'durable-rate-limiter',
   limiterConfig: 'wrangler.jsonc',
-  limitsFile: 'src/limits.ts',
+  limitsFile: 'durable-rate-limiter.limits.jsonc',
 };
 
 /**
