@@ -1,0 +1,271 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  bindingFragment,
+  configureModuleSource,
+  hasTopLevelKey,
+  insertFragment,
+  isValidBindingName,
+  isValidInstanceName,
+  isValidUpstreamLimit,
+  isValidWorkerName,
+  limiterModuleSource,
+  limiterWorkerSource,
+  limiterWranglerConfig,
+  limitsModuleSource,
+  sizeBucket,
+  toIdentifier,
+} from './plan.js';
+import { endpoint, extractDeployedUrl } from './state.js';
+
+describe('sizeBucket', () => {
+  it('sums to the upstream limit, because the worst case is the sum', () => {
+    for (const limit of [2, 3, 10, 60, 61, 1000]) {
+      const bucket = sizeBucket(limit, 60_000);
+      expect(bucket.capacity + bucket.fillPerWindow).toBe(limit);
+      expect(bucket.capacity).toBeGreaterThanOrEqual(1);
+      expect(bucket.fillPerWindow).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it('keeps the burst a minority of the window', () => {
+    expect(sizeBucket(60, 60_000)).toEqual({
+      capacity: 12,
+      fillPerWindow: 48,
+      windowInMs: 60_000,
+    });
+  });
+
+  it('rejects a limit too small to split', () => {
+    expect(isValidUpstreamLimit('1')).toBe(false);
+    expect(isValidUpstreamLimit('2')).toBe(true);
+    expect(isValidUpstreamLimit('2.5')).toBe(false);
+    expect(isValidUpstreamLimit('lots')).toBe(false);
+  });
+});
+
+describe('names', () => {
+  it('accepts Worker names Cloudflare accepts', () => {
+    expect(isValidWorkerName('my-limiter')).toBe(true);
+    expect(isValidWorkerName('My_Limiter')).toBe(false);
+    expect(isValidWorkerName('-leading')).toBe(false);
+  });
+
+  it('requires a binding name to be usable as a key of env', () => {
+    expect(isValidBindingName('RATE_LIMITER')).toBe(true);
+    expect(isValidBindingName('rate-limiter')).toBe(false);
+  });
+
+  it('accepts instance names that read unambiguously', () => {
+    expect(isValidInstanceName('example-api')).toBe(true);
+    expect(isValidInstanceName('billing.api_v2')).toBe(true);
+    expect(isValidInstanceName('two words')).toBe(false);
+  });
+
+  it('turns an instance name into an identifier', () => {
+    expect(toIdentifier('example-api')).toBe('exampleApi');
+    expect(toIdentifier('billing.api_v2')).toBe('billingApiV2');
+    expect(toIdentifier('2fa')).toBe('fa');
+  });
+});
+
+describe('generated config', () => {
+  it('gives the limiter Worker a migration and the consumer none', () => {
+    expect(
+      limiterWranglerConfig({
+        workerName: 'my-limiter',
+        compatibilityDate: '2025-07-01',
+      })
+    ).toContain('"migrations"');
+
+    const consumer = bindingFragment({
+      topology: 'direct',
+      format: 'jsonc',
+      bindingName: 'RATE_LIMITER',
+      workerName: 'my-limiter',
+    });
+    expect(consumer).toContain('"script_name": "my-limiter"');
+    // Named only in the comment explaining why it is absent.
+    expect(consumer).not.toMatch(/^\s*"migrations"\s*:/m);
+  });
+
+  it('names the entrypoint on a service binding', () => {
+    const fragment = bindingFragment({
+      topology: 'service',
+      format: 'jsonc',
+      bindingName: 'LIMITER',
+      workerName: 'my-limiter',
+    });
+    expect(fragment).toContain('"entrypoint": "LimiterEntrypoint"');
+  });
+
+  it('emits TOML for a TOML consumer', () => {
+    expect(
+      bindingFragment({
+        topology: 'direct',
+        format: 'toml',
+        bindingName: 'RATE_LIMITER',
+        workerName: 'my-limiter',
+      })
+    ).toContain('[[durable_objects.bindings]]');
+  });
+});
+
+describe('the limiter Worker', () => {
+  it('is a bare re-export when there is no config route', () => {
+    const source = limiterWorkerSource({ configRoute: false });
+    expect(source).toContain('export { LimiterDO, LimiterEntrypoint }');
+    expect(source).not.toContain('/configure');
+    expect(source).not.toContain('DRL_CONFIG_KEY');
+  });
+
+  it('denies the config route when the secret is unset', () => {
+    const source = limiterWorkerSource({ configRoute: true });
+    // The guard must fail closed: no secret means no access, never open access.
+    expect(source).toContain(
+      "if (expected === undefined || expected === '' || provided === null) {"
+    );
+    expect(source).toContain('return false;');
+    expect(source).toContain("new Response('unauthorized', { status: 401 })");
+  });
+
+  it('configures only on /configure, and always reports stats', () => {
+    const source = limiterWorkerSource({ configRoute: true });
+    expect(source).toContain('if (configuring) await stub.configure(config);');
+    expect(source).toContain('result[name] = await stub.stats();');
+  });
+
+  it('writes one limits entry per bucket', () => {
+    const source = limitsModuleSource([
+      {
+        name: 'read-api',
+        bucket: { capacity: 12, fillPerWindow: 48, windowInMs: 60_000 },
+        concurrency: 5,
+      },
+      {
+        name: 'write-api',
+        bucket: { capacity: 6, fillPerWindow: 24, windowInMs: 60_000 },
+        concurrency: 2,
+      },
+    ]);
+    expect(source).toContain("'read-api': {");
+    expect(source).toContain("'write-api': {");
+    expect(source).toContain('fillPerWindow: 24');
+  });
+});
+
+describe('talking to a deployed limiter', () => {
+  it('reads the origin out of wrangler deploy output', () => {
+    const output = [
+      'Total Upload: 21.51 KiB / gzip: 4.72 KiB',
+      'Deployed durable-rate-limiter triggers (0.51 sec)',
+      '  https://durable-rate-limiter.my-account.workers.dev',
+      'Current Version ID: 1234',
+    ].join('\n');
+    expect(extractDeployedUrl(output)).toBe(
+      'https://durable-rate-limiter.my-account.workers.dev'
+    );
+    expect(extractDeployedUrl('no url here')).toBeUndefined();
+  });
+
+  it('builds the guarded endpoint, escaping the key', () => {
+    expect(
+      endpoint('https://limiter.example.workers.dev', 'configure', 'a b&c')
+    ).toBe('https://limiter.example.workers.dev/configure?key=a+b%26c');
+    expect(endpoint('https://limiter.example.workers.dev/', 'stats', 'k')).toBe(
+      'https://limiter.example.workers.dev/stats?key=k'
+    );
+  });
+});
+
+describe('generated modules', () => {
+  it('writes the instance name exactly once', () => {
+    const source = limiterModuleSource({
+      topology: 'direct',
+      bindingName: 'RATE_LIMITER',
+      instanceName: 'example-api',
+    });
+    expect(source.match(/'example-api'/g)).toHaveLength(1);
+    expect(source).toContain("defineBinder('RATE_LIMITER')");
+  });
+
+  it('reaches the service topology through defineTestBinder', () => {
+    const source = limiterModuleSource({
+      topology: 'service',
+      bindingName: 'LIMITER',
+      instanceName: 'example-api',
+    });
+    expect(source).toContain('defineTestBinder');
+    expect(source).toContain('env.LIMITER.execute(name, fn)');
+  });
+
+  it('configures through the stub directly, or the entrypoint by name', () => {
+    const bucket = { capacity: 5, fillPerWindow: 55, windowInMs: 60_000 };
+    const direct = configureModuleSource({
+      topology: 'direct',
+      bindingName: 'RATE_LIMITER',
+      instanceName: 'example-api',
+      bucket,
+      concurrency: 5,
+    });
+    expect(direct).toContain('as unknown as LimiterRpc');
+    expect(direct).toContain('capacity: 5');
+
+    const service = configureModuleSource({
+      topology: 'service',
+      bindingName: 'LIMITER',
+      instanceName: 'example-api',
+      bucket,
+      concurrency: 5,
+    });
+    expect(service).toContain("env.LIMITER.configure('example-api'");
+  });
+});
+
+describe('editing an existing config', () => {
+  const jsonc = `{\n  // a comment worth keeping\n  "name": "app",\n}\n`;
+
+  it('inserts without reserialising, so comments survive', () => {
+    const result = insertFragment(
+      jsonc,
+      bindingFragment({
+        topology: 'direct',
+        format: 'jsonc',
+        bindingName: 'RATE_LIMITER',
+        workerName: 'my-limiter',
+      }),
+      'jsonc'
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.text).toContain('// a comment worth keeping');
+    expect(result.text).toContain('"name": "app"');
+    expect(result.text).toContain('"class_name": "LimiterDO"');
+    expect(result.text.indexOf('durable_objects')).toBeLessThan(
+      result.text.indexOf('"name": "app"')
+    );
+  });
+
+  it('appends to TOML, where order does not matter', () => {
+    const result = insertFragment('name = "app"\n', '[[services]]\n', 'toml');
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.text).toBe('name = "app"\n\n[[services]]\n');
+  });
+
+  it('refuses a file it cannot place the fragment in', () => {
+    const result = insertFragment('not a config', 'x', 'jsonc');
+    expect(result.ok).toBe(false);
+  });
+
+  it('detects an existing key in either format', () => {
+    expect(hasTopLevelKey('{ "durable_objects": {} }', 'durable_objects')).toBe(
+      true
+    );
+    expect(
+      hasTopLevelKey('[[durable_objects.bindings]]', 'durable_objects')
+    ).toBe(true);
+    expect(hasTopLevelKey(jsonc, 'durable_objects')).toBe(false);
+    expect(hasTopLevelKey(jsonc, 'services')).toBe(false);
+  });
+});

@@ -2,6 +2,10 @@ import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
 
 export default defineWorkersConfig({
   test: {
+    // The package's own suites only. `cli/` is Node — it imports node:os and
+    // node:child_process, which do not resolve inside workerd — and runs under
+    // vitest.cli.config.ts instead.
+    include: ['test/**/*.test.ts'],
     poolOptions: {
       workers: {
         wrangler: { configPath: './wrangler.jsonc' },

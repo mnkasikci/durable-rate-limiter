@@ -158,7 +158,7 @@ configured limiter can be exported as a module-scope singleton. The predecessor
 package could not be — its constructor started an interval, and Workers rejects
 timers at module scope with a failure that appears only at deploy.
 
-> Define at module scope. Bind and call inside a request handler.
+> Define at module scope. Bind and call wherever you have `env`.
 
 ## Observable
 

@@ -33,6 +33,9 @@
     "access": "public",
     "provenance": true
   },
+  "bin": {
+    "durable-rate-limiter": "./dist/cli.js"
+  },
   "exports": {
     "./do": {
       "types": "./dist/do.d.ts",
@@ -53,17 +56,18 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "rm -rf dist && tsup",
     "clean": "rm -rf dist coverage",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p cli/tsconfig.json",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:cli": "vitest run --config vitest.cli.config.ts",
     "coverage": "vitest run --coverage",
-    "check": "npm run typecheck && npm run lint && npm run format:check && npm run coverage",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run coverage && npm run test:cli",
     "verify:typecheck": "tsc -p verify/tsconfig.json",
     "prepublishOnly": "npm run clean && npm run check && npm run build"
   },
@@ -71,6 +75,7 @@
     "@cloudflare/vitest-pool-workers": "^0.9.0",
     "@cloudflare/workers-types": "^5.20260714.1",
     "@eslint/js": "^9.32.0",
+    "@types/node": "^22.0.0",
     "@vitest/coverage-istanbul": "~3.2.0",
     "eslint": "^9.32.0",
     "eslint-config-prettier": "^10.1.0",

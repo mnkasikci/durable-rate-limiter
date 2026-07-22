@@ -21,6 +21,16 @@ src/do/       the limiter Worker: the Durable Object class and its entrypoint.
 src/client/   what consuming apps import: defineBinder, defineTestBinder,
               defineLimiter, call(). Hooks and retries live here.
 test/         Vitest suites, run under @cloudflare/vitest-pool-workers.
+cli/          the setup CLI (`init`, `configure`, `stats`). Node, not workerd:
+              its own tsconfig, its own vitest config, and outside the 100%
+              coverage thresholds, which cover `src`. `plan.ts` holds every
+              generated string and every validation rule as pure functions;
+              `init.ts`, `remote.ts` and `prompt.ts` do I/O and decide nothing.
+              It generates code against the published subpaths, exactly as a
+              consumer would, and never reaches into `src`. `configure` works
+              through a key-guarded route on the *generated* limiter Worker:
+              `configure` is a DO method, no wrangler command reaches one, and
+              this package stays free of an HTTP config surface.
 docs/         preface.md and Features.md — the basis of the README.
 ```
 
@@ -50,7 +60,7 @@ module-scope singleton could not be constructed at all.
 `defineBinder` and `defineLimiter` must therefore be pure config-capture
 functions returning inert objects. The rule consumers are given is:
 
-> Define at module scope. Bind and call inside a request handler.
+> Define at module scope. Bind and call wherever you have `env`.
 
 That promise only holds if every code path reachable from module evaluation is
 free of side effects. When adding a top-level `const`, ask what its initialiser
@@ -158,6 +168,7 @@ an otherwise quiet object.
 | ------------------------------------- | -------------------------------------------------------------------- |
 | `npm run check`                       | typecheck + lint + format check + coverage. Run before every commit. |
 | `npm test`                            | Vitest under workerd                                                 |
+| `npm run test:cli`                    | Vitest under Node, for `cli/` — the one suite workerd cannot run     |
 | `npm run coverage`                    | Vitest with istanbul coverage and 100% thresholds                    |
 | `npm run build`                       | tsup → `dist/do.*`, `dist/client.*`                                  |
 | `npm run lint:fix` / `npm run format` | autofix                                                              |

@@ -10,6 +10,34 @@ A change to it is always a breaking change and is called out explicitly below.
 
 ## [Unreleased]
 
+### Added
+
+- **CLI** — `npx @bakidev/durable-rate-limiter init` walks the README's five
+  setup steps interactively: scaffolds the limiter Worker and offers to deploy
+  it, inserts the binding into an existing wrangler config (by textual
+  insertion, so comments survive), writes the limiter module with the instance
+  name in exactly one place, and sizes the bucket so that
+  `capacity + fillPerWindow` fits under the upstream limit rather than
+  `fillPerWindow` alone. Both topologies are supported. `--yes` takes every
+  default and never deploys. No runtime dependencies.
+- **CLI** — `configure` and `stats`. `configure` is a method on the Durable
+  Object, so only a deployed Worker can call it and no `wrangler` command
+  reaches one. `init` therefore offers to scaffold the limiter Worker with a
+  key-guarded `/configure` and `/stats` route, and to declare the limits beside
+  it in `limits.ts`: they live in version control, change in a diff, and are
+  applied by `configure` after a deploy. `init` sets the guarding secret and
+  applies them itself, so the bucket is live before it exits. Both routes deny
+  everything while `DRL_CONFIG_KEY` is unset — one name for the Worker secret
+  and the environment variable the CLI reads, so the two are recognisably the
+  same thing wherever they are seen. Both `init` and `configure` say how to
+  replace a key you no longer have, since a secret cannot be read back.
+  Declining the route falls back to a generated `configureLimiter(env)` module. `init` records what it built in
+  `.durable-rate-limiter.jsonc` **inside the limiter's own folder**, so a
+  consuming project gains one directory and no root dotfile; the file carries a
+  comment saying what deleting it breaks, holds no secrets, and stores every
+  path relative to itself. `configure` and `stats` find it from anywhere in the
+  project and never climb past a repository root.
+
 ## [0.1.0] — 2026-07-21
 
 First public release. `ENVELOPE_VERSION` 1.

@@ -100,6 +100,11 @@ Minimal configuration, start to first paced call. This uses the one-hop
 cross-script binding, which is the shortest correct path; the service-binding
 topology is described [below](#the-other-topology-a-service-binding).
 
+> **Or let the CLI do it.** `npx @bakidev/durable-rate-limiter init`, run from
+> your application's root, walks these five steps and writes every file below —
+> including sizing the bucket against your upstream's real limit. It shows each
+> file and command before it acts. [What it does, exactly.](#the-setup-cli)
+
 ### 1. Create the limiter Worker
 
 The object **must live in a Worker of its own** — see
@@ -174,12 +179,17 @@ const binder = defineBinder('RATE_LIMITER'); // WHICH binding — typechecked
 export const api = defineLimiter({ binder, name: 'example-api' }); // WHICH bucket
 ```
 
-> **Define at module scope. Bind and call inside a request handler.**
+> **Define at module scope. Bind and call wherever you have `env`.**
 
 `defineBinder` and `defineLimiter` perform no I/O and start no timers, so a
-configured limiter is safe as a module-scope singleton. `name` is the instance
-name (`idFromName`'s argument): `example-api`, `billing-api` and `search-api` are
-independent buckets on the same class and the same binding.
+configured limiter is safe as a module-scope singleton. Binding is a separate
+step because it needs `env` — a fetch or scheduled handler, a queue consumer, a
+Workflow step, a Durable Object method all qualify. Module scope is the one
+place that does not, because `env` does not exist there.
+
+`name` is the instance name (`idFromName`'s argument): `example-api`,
+`billing-api` and `search-api` are independent buckets on the same class and the
+same binding.
 
 ### 4. Call
 
@@ -189,7 +199,7 @@ import { api } from './limiter.js';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const limiter = api.for(env); // per request — env exists only here
+    const limiter = api.for(env); // here, because `env` exists here
 
     const file = await limiter.call(
       () =>
@@ -226,6 +236,101 @@ await stub.configure({
 
 console.log(await stub.stats()); // live tokens, penalty state, in-flight, config
 ```
+
+---
+
+## The setup CLI
+
+Every step above is mechanical, and every one of them is a chance to get a name
+wrong — a mistyped instance name does not error, it silently creates a second
+bucket. The CLI asks instead.
+
+```sh
+cd my-application
+npx @bakidev/durable-rate-limiter init
+```
+
+It walks the five steps in the order they must happen — the limiter Worker
+first, because a consumer's binding names it — and for each one:
+
+| Step           | What `init` does                                                                                                     |
+| -------------- | -------------------------------------------------------------------------------------------------------------------- |
+| limiter Worker | scaffolds `src/index.ts` and `wrangler.jsonc`                                                                        |
+| binding        | asks which topology, then inserts the binding into your existing config                                              |
+| types          | offers to run `wrangler types`, so `defineBinder` typechecks the binding name                                        |
+| limiter module | writes `src/limiter.ts` with the binder and the instance name — the name written once                                |
+| limits         | asks your upstream's real limit and sizes `capacity + fillPerWindow` to fit under it                                 |
+| deploy         | deploys the limiter Worker, sets its guard secret, and applies those limits — the bucket is live before `init` exits |
+
+It opens by telling you to commit first, and reports whether your working tree is
+clean, because everything after that is easiest to read as a diff. Nothing is
+written or run before it is shown, existing files are never overwritten without
+asking, and your wrangler config is edited by insertion rather than reserialised
+— a round-trip through a JSON parser would delete every comment in a file whose
+format exists to have them. If the relevant key is already present, `init` prints
+the fragment for you to merge instead of guessing.
+
+Anything it could not do ends up in a "still to do" list with the exact command.
+`--yes` takes every default without asking, and never deploys.
+
+### Configuring without writing a deploy script
+
+`configure` is a method on the Durable Object, so **only a deployed Worker can
+call it** — no `wrangler` command reaches a DO method. `init` therefore offers to
+give the limiter Worker a key-guarded route, and to put your limits beside it as
+code:
+
+```ts
+// durable-rate-limiter/src/limits.ts — one entry per upstream limit
+export const LIMITS: Record<string, Partial<LimiterConfig>> = {
+  'read-api': {
+    bucket: { capacity: 12, fillPerWindow: 48, windowInMs: 60_000 },
+    concurrency: 5,
+  },
+  'write-api': {
+    bucket: { capacity: 6, fillPerWindow: 24, windowInMs: 60_000 },
+    concurrency: 2,
+  },
+};
+```
+
+The limits then live in version control, change in a reviewable diff, and are
+applied by two commands:
+
+```sh
+npx @bakidev/durable-rate-limiter configure   # deploy the limiter Worker, then apply LIMITS
+npx @bakidev/durable-rate-limiter stats       # read every bucket's live state back
+```
+
+Both routes are guarded by a `DRL_CONFIG_KEY` secret and **deny everything while it
+is unset** — an unset secret means denied, never open. `init` generates a key,
+sets it with `wrangler secret put`, and applies your limits before it exits, so
+the bucket is configured by the time anything calls it. The Worker's secret and
+the environment variable the CLI reads share that one name deliberately — seeing
+`DRL_CONFIG_KEY` in the Cloudflare dashboard should tell you what it belongs to.
+Export it to skip the prompt in CI.
+
+A secret cannot be read back, so a key you have lost and a key you have typed
+wrong have the same remedy: set a new one, which replaces it. Both commands say
+so at the point it matters.
+
+```sh
+npx wrangler secret put DRL_CONFIG_KEY --config durable-rate-limiter/wrangler.jsonc
+# or: Workers & Pages → your limiter Worker → Settings → Variables and Secrets
+```
+
+`init` leaves a `.durable-rate-limiter.jsonc` **inside the limiter's own folder**
+— your project root gains one directory and nothing else. It records the Worker
+name, its config, where the limits live and the deployed URL; no secrets, so
+commit it. Every path in it is relative to that folder, and `configure`/`stats`
+find it from anywhere in the project, so they work from a subdirectory too.
+
+Decline the route and `init` writes a `configureLimiter(env)` module instead, for
+you to call from a deploy script, an admin route, or a guarded first-run path.
+
+> `configure` rebuilds each bucket and **rejects anyone currently queued** —
+> their wait can never be satisfied under limits that no longer exist. It is a
+> setup call, not a per-request one. Prefer a quiet moment.
 
 ---
 
@@ -357,7 +462,7 @@ retried as an unknown error.
 //    never locally, never in tests.
 const bound = api.for(env);
 
-// ✅ Define at module scope, bind and call inside the handler.
+// ✅ Define at module scope; bind and call wherever `env` reaches you.
 export const api = defineLimiter({ binder, name: 'example-api' });
 ```
 

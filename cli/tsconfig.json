@@ -1,0 +1,18 @@
+{
+  // The CLI is the one part of this repo that is Node, not workerd. It gets its
+  // own project so `@types/node` and `@cloudflare/workers-types` never share a
+  // compilation — they disagree about several globals, and the root project's
+  // answer is the correct one for `src`.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "emitDeclarationOnly": false,
+    "declaration": false,
+    "rootDir": ".",
+    "outDir": "../dist"
+  },
+  "include": [".", "*.test.ts"]
+}
