@@ -33,11 +33,15 @@
  *
  * ## Cost
  *
- * The price of that exactness is state: the persisted log holds up to
- * `limitPerWindow` entries and is written through once per grant. That is
- * nothing for limits in the hundreds, which is the range this is built for;
- * before configuring a limit in the tens of thousands, weigh the per-grant
- * write and the size of the persisted blob.
+ * The price of that exactness is state, and it is written through once per take.
+ * Takes that land on the same millisecond are coalesced into a single grant, so
+ * the persisted log holds at most one entry per distinct take-instant still
+ * inside the window: `limitPerWindow` entries in the ordinary case of
+ * whole-number takes, and never more than `min(limitPerWindow / smallestAmount,
+ * windowInMs)` even under fractional ones. That is nothing for limits in the
+ * hundreds, which is the range this is built for; before configuring a limit in
+ * the tens of thousands, weigh the per-grant write and the size of the persisted
+ * blob.
  */
 
 /** One successful take: the instant it landed and the amount it took. */
@@ -64,8 +68,13 @@ export interface BucketOptions {
   limitPerWindow: number;
   windowInMs: number;
   /**
-   * Fraction of the limit handed back when a penalty lifts; default `0.5`. See
-   * `pause()` for why it is not `1`.
+   * How much of the limit the window reopens with the instant a penalty lifts,
+   * as a fraction; default `0.5`. The name is token-bucket vocabulary kept for
+   * API stability — there is no bucket being refilled. In sliding-log terms it
+   * sets a floor on the *spend* the recovering window carries: `pause()` seeds a
+   * synthetic grant so that, when the penalty ends, only `penaltyRefillFraction`
+   * of the limit is immediately spendable and the whole limit one window later.
+   * See `pause()` for why the default is not `1`.
    */
   penaltyRefillFraction?: number;
 }
@@ -93,6 +102,14 @@ export class BucketDestroyedError extends Error {
 
 /** Default for `penaltyRefillFraction`; see `pause()` for why it is not `0`. */
 const DEFAULT_PENALTY_REFILL_FRACTION = 0.5;
+
+/**
+ * The largest delay `setTimeout` honours. Node and workerd store the delay in a
+ * signed 32-bit int, so anything above this is silently truncated (in practice
+ * clamped to `1`), which would turn a long wait into a 1ms hot loop. Longer
+ * waits are served by chaining maximum-length timers instead.
+ */
+const MAX_TIMER_DELAY = 2 ** 31 - 1;
 
 interface Waiter {
   amount: number;
@@ -197,9 +214,21 @@ export class SlidingLogBucket {
    * enough entries aged out, which for a long window is indistinguishable from a
    * hang. Dropping the oldest is the least surprising loss — those entries are
    * the closest to expiry anyway.
+   *
+   * A grant dated in the future breaks the ascending-`at` invariant every read
+   * relies on: `consume` appends `{ at: now }`, and a later grant sorted before
+   * it would make `msUntilAvailable` walk out of order and return a wrong wait.
+   * The one legitimate future date is the penalty's synthetic grant, dated at
+   * `forcedUntil`; anything past that is a corrupt snapshot, so `at` is clamped
+   * to `max(now, forcedUntil)` — conservative, keeping the spend rather than
+   * discarding it.
    */
   #restoreGrants(grants: BucketGrant[], now: number): BucketGrant[] {
-    const live = [...grants]
+    const ceiling = Math.max(now, this.#forcedUntil);
+    const live = grants
+      .map((grant) =>
+        grant.at > ceiling ? { at: ceiling, amount: grant.amount } : grant
+      )
       .sort((a, b) => a.at - b.at)
       .filter((grant) => grant.at + this.#windowInMs > now);
 
@@ -217,17 +246,30 @@ export class SlidingLogBucket {
     return kept;
   }
 
-  /** A copy of the persistable pair, pruned to `now`. */
+  /**
+   * A copy of the persistable pair as it stands at `now`, with aged-out grants
+   * excluded. A pure read: it does not mutate the log, so projecting a future or
+   * out-of-order `now` cannot evict grants a later real `consume` still needs.
+   */
   getState(now: number = Date.now()): BucketState {
-    this.#prune(now);
-    return this.#snapshot();
+    requireFinite('now', now);
+    return {
+      grants: this.#liveGrants(now).map((grant) => ({
+        at: grant.at,
+        amount: grant.amount,
+      })),
+      forcedUntil: this.#forcedUntil,
+    };
   }
 
-  /** Amount available in the current rolling window right now, fractional. */
+  /**
+   * Amount available in the current rolling window at `now`, fractional. A pure
+   * read — see `getState` — so it never evicts a still-live grant.
+   */
   available(now: number = Date.now()): number {
-    this.#prune(now);
+    requireFinite('now', now);
     if (now < this.#forcedUntil) return 0;
-    return this.#limitPerWindow - this.#used();
+    return this.#limitPerWindow - this.#usedAt(now);
   }
 
   /** Takes `amount` if it is available. Never blocks. */
@@ -244,9 +286,18 @@ export class SlidingLogBucket {
     }
 
     // Every surviving grant has `at <= now` (a future-dated grant only exists
-    // under a penalty, which the guard above already refused), so appending
-    // keeps the log sorted ascending.
-    this.#grants.push({ at: now, amount });
+    // under a penalty, which the guard above already refused), so the newest
+    // grant is the tail. Takes on the same millisecond are folded into it rather
+    // than appended: they share an expiry, so one summed grant is exact, and it
+    // caps the log at one entry per distinct instant instead of one per take —
+    // the difference between `limitPerWindow` and `limitPerWindow / smallest`
+    // entries under fractional amounts.
+    const tail = this.#grants[this.#grants.length - 1];
+    if (tail?.at === now) {
+      tail.amount += amount;
+    } else {
+      this.#grants.push({ at: now, amount });
+    }
     this.#emit();
     return true;
   }
@@ -268,9 +319,13 @@ export class SlidingLogBucket {
   /** Milliseconds until `amount` can be taken; `0` means now. */
   msUntilAvailable(amount: number, now: number = Date.now()): number {
     this.#assertAmount(amount);
-    this.#prune(now);
+    requireFinite('now', now);
 
-    const used = this.#used();
+    // A pure read — see `getState` — so it computes over the live grants without
+    // pruning the stored log.
+    const live = this.#liveGrants(now);
+    let used = 0;
+    for (const grant of live) used += grant.amount;
 
     // A penalty freezes the log `pause` set to a single synthetic grant dated
     // at `forcedUntil`, so the allowance the recovering window opens with is
@@ -292,7 +347,7 @@ export class SlidingLogBucket {
     // always exists — the loop is entered only when the log is non-empty.
     let freed = 0;
     let readyAt = now;
-    for (const grant of this.#grants) {
+    for (const grant of live) {
       freed += grant.amount;
       readyAt = grant.at + this.#windowInMs;
       if (used - freed + amount <= this.#limitPerWindow) break;
@@ -303,6 +358,12 @@ export class SlidingLogBucket {
   /**
    * Feeds an upstream rate-limit response back in so it throttles *every*
    * caller, not just the one that received it.
+   *
+   * The guarantee is preserved across the pause: the synthetic spend the
+   * recovering window carries is never *less* than the real spend that is still
+   * inside its rolling window when the penalty lifts. `penaltyRefillFraction` is
+   * a floor on that spend, not a reset of it — so a pause shorter than the
+   * window cannot hand back room that already-issued grants have spent.
    */
   pause(ms: number, now: number = Date.now()): void {
     this.#assertAlive();
@@ -317,14 +378,27 @@ export class SlidingLogBucket {
     // The recovering window opens at the penalty's end, and it does not open
     // full: a whole window aimed at an API that just asked for backoff re-trips
     // it immediately. The log is replaced with one synthetic grant dated at the
-    // penalty's end and carrying the amount already spent, so the window that
-    // opens then holds `penaltyRefillFraction` of the limit and the full limit
-    // one window later. Half rather than empty — zeroed penalties stack
-    // multiplicatively and the recovery curve is far steeper than the sum of
-    // the individual delays. A zero-amount synthetic grant (fraction `1`) is
-    // simply an empty log: nothing to persist, and nothing a restore could
-    // reject for being non-positive.
-    const spent = this.#limitPerWindow * (1 - this.#penaltyRefillFraction);
+    // penalty's end so the window that opens then holds at most
+    // `penaltyRefillFraction` of the limit and the full limit one window later.
+    // Half rather than empty — zeroed penalties stack multiplicatively and the
+    // recovery curve is far steeper than the sum of the individual delays.
+    //
+    // But the fraction is only a floor. Real grants still inside their window at
+    // the moment the penalty lifts are physically part of the rolling window
+    // that opens then; recording less than they represent would let the window
+    // re-admit room reality has already spent, breaking the two-sided guarantee
+    // for a pause shorter than the window. So the synthetic amount is the larger
+    // of the fraction floor and that surviving live spend. A zero-amount grant
+    // (fraction `1`, no surviving spend) is simply an empty log: nothing to
+    // persist, and nothing a restore could reject for being non-positive.
+    let liveAtLift = 0;
+    for (const grant of this.#grants) {
+      if (grant.at + this.#windowInMs > this.#forcedUntil) {
+        liveAtLift += grant.amount;
+      }
+    }
+    const floor = this.#limitPerWindow * (1 - this.#penaltyRefillFraction);
+    const spent = Math.max(floor, liveAtLift);
     this.#grants = spent > 0 ? [{ at: this.#forcedUntil, amount: spent }] : [];
 
     this.#emit();
@@ -371,6 +445,26 @@ export class SlidingLogBucket {
   }
 
   /**
+   * The grants still inside their window at `now`, as a new array, without
+   * touching the stored log. What the pure reads (`getState`, `available`,
+   * `msUntilAvailable`) compute over so a projected clock cannot evict grants a
+   * later real `consume` still needs. Order is preserved, so the result stays
+   * sorted ascending.
+   */
+  #liveGrants(now: number): BucketGrant[] {
+    return this.#grants.filter((grant) => grant.at + this.#windowInMs > now);
+  }
+
+  /** Sum of the grants still inside their window at `now`, without pruning. */
+  #usedAt(now: number): number {
+    let total = 0;
+    for (const grant of this.#grants) {
+      if (grant.at + this.#windowInMs > now) total += grant.amount;
+    }
+    return total;
+  }
+
+  /**
    * Releases waiters strictly head-of-line. Only the head is ever considered;
    * if it cannot be satisfied we stop. Scanning for any satisfiable waiter
    * serves cheap `amount: 1` callers past an expensive `amount: 5` one
@@ -392,6 +486,12 @@ export class SlidingLogBucket {
    * the queue drains. No timer may exist unless a caller is waiting — a
    * pending timer prevents an idle host from hibernating and bills duration
    * around the clock. Never a repeating tick.
+   *
+   * The delay is clamped to `MAX_TIMER_DELAY`: a wait longer than the
+   * `setTimeout` ceiling (a window or penalty past ~24.8 days) would otherwise
+   * be truncated to 1ms and busy-loop. When the timer fires early because it was
+   * clamped, `#pump` finds the head still unsatisfiable and reschedules the
+   * remaining wait — chaining maximum-length timers until the deficit clears.
    */
   #schedule(): void {
     this.#clearTimer();
@@ -400,7 +500,10 @@ export class SlidingLogBucket {
 
     // At least 1ms: a 0ms timer that re-enters a still-unsatisfiable pump is
     // the hot loop this whole design exists to avoid.
-    const delay = Math.max(1, this.msUntilAvailable(head.amount));
+    const delay = Math.min(
+      MAX_TIMER_DELAY,
+      Math.max(1, this.msUntilAvailable(head.amount))
+    );
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
       this.#pump();

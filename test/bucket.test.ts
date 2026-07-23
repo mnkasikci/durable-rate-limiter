@@ -318,10 +318,56 @@ describe('penalties', () => {
     bucket.consume(1, t0 + 1);
     bucket.pause(1000, t0 + 2);
     // The earlier grants are gone: a penalty is a hard reset of the log, not an
-    // addition to it.
+    // addition to it. Those grants age out (t0 + 150) long before the penalty
+    // lifts (t0 + 1002), so none survive into the recovering window and the
+    // fraction floor governs.
     expect(bucket.getState(t0 + 2).grants).toEqual([
       { at: t0 + 1002, amount: 1.5 },
     ]);
+    bucket.destroy();
+  });
+
+  it('never over-admits when a pause shorter than the window discards a filled log', () => {
+    const t0 = 1_000_000;
+    const bucket = new SlidingLogBucket({
+      limitPerWindow: 10,
+      windowInMs: 1000,
+      penaltyRefillFraction: 0.5,
+    });
+
+    // Fill the window, then pause for less than a window. The ten real grants
+    // are still inside the rolling window that ends when the penalty lifts, so
+    // the synthetic spend must not drop below them to the fraction floor of 5 —
+    // that would physically issue 15 units inside one 1000ms window.
+    expect(bucket.consume(10, t0)).toBe(true);
+    bucket.pause(100, t0);
+
+    // A naive `limit * (1 - fraction)` would report 5 used and admit 5 more.
+    expect(bucket.available(t0 + 101)).toBe(0);
+    expect(bucket.consume(5, t0 + 101)).toBe(false);
+    expect(bucket.consume(0.5, t0 + 101)).toBe(false);
+    // The synthetic grant carrying the surviving spend is dated at the penalty's
+    // end (t0 + 100), so the whole limit only returns one window later, at
+    // t0 + 1100 — never sooner. No rolling 1000ms span ever held more than 10.
+    expect(bucket.available(t0 + 1099)).toBe(0);
+    expect(bucket.available(t0 + 1100)).toBe(10);
+    bucket.destroy();
+  });
+
+  it('opens at the fraction, not the pre-pause spend, once a full window has elapsed', () => {
+    const t0 = 1_000_000;
+    const bucket = new SlidingLogBucket({
+      limitPerWindow: 10,
+      windowInMs: 1000,
+      penaltyRefillFraction: 0.5,
+    });
+
+    // Same filled window, but a pause at least as long as the window: the real
+    // grants age out before the penalty lifts, so none survive into the
+    // recovering window and the fraction floor — not the old spend — governs.
+    expect(bucket.consume(10, t0)).toBe(true);
+    bucket.pause(1000, t0);
+    expect(bucket.available(t0 + 1000)).toBe(5);
     bucket.destroy();
   });
 });
@@ -572,6 +618,128 @@ describe('state reporting', () => {
 
     // Neither the array nor its entries alias anything inside the bucket.
     expect(bucket.getState(t0).grants).toEqual([{ at: t0, amount: 1 }]);
+    bucket.destroy();
+  });
+});
+
+describe('fractional takes and the log bound', () => {
+  it('coalesces same-instant takes into one grant instead of one per take', () => {
+    const t0 = 1_000_000;
+    const bucket = new SlidingLogBucket({
+      limitPerWindow: 100,
+      windowInMs: 1000,
+    });
+
+    // Without coalescing these 5000 fractional takes would be 5000 separate
+    // grants, each rewritten through the persisted blob — the documented
+    // "up to limitPerWindow entries" bound quietly broken by fractional amounts.
+    for (let i = 0; i < 5000; i++) {
+      expect(bucket.consume(0.01, t0)).toBe(true);
+    }
+
+    const state = bucket.getState(t0);
+    expect(state.grants).toHaveLength(1);
+    expect(state.grants[0]?.amount).toBeCloseTo(50);
+    // The allowance is still counted exactly — coalescing changes storage, not
+    // semantics.
+    expect(bucket.available(t0)).toBeCloseTo(50);
+    bucket.destroy();
+  });
+
+  it('holds at most one grant per distinct take-instant', () => {
+    const t0 = 1_000_000;
+    const bucket = new SlidingLogBucket({
+      limitPerWindow: 100,
+      windowInMs: 1000,
+    });
+
+    // Ten instants, fifty fractional takes each: ten grants, not five hundred.
+    for (let ms = 0; ms < 10; ms++) {
+      for (let i = 0; i < 50; i++) {
+        expect(bucket.consume(0.02, t0 + ms)).toBe(true);
+      }
+    }
+    expect(bucket.getState(t0 + 9).grants.length).toBeLessThanOrEqual(10);
+    bucket.destroy();
+  });
+});
+
+describe('reads are pure', () => {
+  it('does not evict live grants when a read projects a future clock', () => {
+    const t0 = 1_000_000;
+    const bucket = new SlidingLogBucket({ limitPerWindow: 3, windowInMs: 150 });
+    expect(bucket.consume(3, t0)).toBe(true);
+
+    // Project far past every grant's expiry through each read-shaped accessor.
+    // If any of them pruned the stored log, the grants would be gone.
+    expect(bucket.available(t0 + 60_000)).toBe(3);
+    expect(bucket.getState(t0 + 60_000).grants).toEqual([]);
+    expect(bucket.msUntilAvailable(1, t0 + 60_000)).toBe(0);
+
+    // Back at the real clock the window is still full: the future reads evicted
+    // nothing, so a real consume cannot over-admit.
+    expect(bucket.available(t0 + 1)).toBe(0);
+    expect(bucket.consume(1, t0 + 1)).toBe(false);
+    bucket.destroy();
+  });
+});
+
+describe('scheduling ceiling', () => {
+  it('clamps a scheduled delay to the setTimeout ceiling instead of hot-looping', () => {
+    // A window past ~24.8 days: msUntilAvailable on the spent window returns a
+    // delay above the signed-32-bit setTimeout ceiling, which Node truncates to
+    // 1ms — a CPU-burning reschedule loop unless clamped.
+    const window = 2 ** 32;
+    const bucket = new SlidingLogBucket(
+      { limitPerWindow: 1, windowInMs: window },
+      { state: { grants: [{ at: Date.now(), amount: 1 }], forcedUntil: 0 } }
+    );
+
+    const spy = vi.spyOn(globalThis, 'setTimeout');
+    void bucket.consumeAsync(1).catch(() => undefined);
+
+    const delays = spy.mock.calls.map((call) => call[1]);
+    expect(spy).toHaveBeenCalled();
+    expect(delays.every((d) => d === undefined || d <= 2 ** 31 - 1)).toBe(true);
+
+    bucket.destroy();
+    spy.mockRestore();
+  });
+});
+
+describe('restoring a corrupt snapshot', () => {
+  it('clamps a future-dated grant so the log stays sorted for later takes', () => {
+    const now = Date.now();
+    // A grant dated in the future is only producible by corruption (or a bad
+    // hand-built snapshot). Keeping it verbatim would break the ascending-`at`
+    // invariant once `consume` appends `{ at: now }`, misleading msUntilAvailable.
+    const bucket = new SlidingLogBucket(FAST, {
+      state: { grants: [{ at: now + 10_000, amount: 1 }], forcedUntil: 0 },
+    });
+
+    // Pulled back to `now`, never left in the future.
+    expect(bucket.getState(now).grants.every((g) => g.at <= now)).toBe(true);
+    expect(bucket.consume(1, now)).toBe(true);
+    const wait = bucket.msUntilAvailable(3, now);
+    expect(Number.isFinite(wait)).toBe(true);
+    expect(wait).toBeGreaterThanOrEqual(0);
+    bucket.destroy();
+  });
+
+  it('preserves a legitimately future-dated penalty grant on restore', () => {
+    const now = Date.now();
+    const forcedUntil = now + 5000;
+    // A bucket evicted mid-penalty persists its synthetic grant dated at
+    // forcedUntil — a legitimate future date. Clamping it to `now` would reopen
+    // the window early, so it must survive at forcedUntil.
+    const bucket = new SlidingLogBucket(FAST, {
+      state: { grants: [{ at: forcedUntil, amount: 1.5 }], forcedUntil },
+    });
+
+    expect(bucket.available(now)).toBe(0);
+    expect(bucket.getState(now).grants).toEqual([
+      { at: forcedUntil, amount: 1.5 },
+    ]);
     bucket.destroy();
   });
 });

@@ -234,7 +234,15 @@ function headerValue(carrier: unknown, name: string): string | undefined {
 
 /** `"120"` → 120000; an HTTP-date → ms from `now`; anything else → undefined. */
 function parseRetryAfter(raw: string, now: number): number | undefined {
-  const seconds = Number(raw.trim());
+  const trimmed = raw.trim();
+  // `Number('')` is `0`, not `NaN`, and `0` is finite — so a present-but-empty
+  // (or whitespace-only) header would parse to a 0ms delay, and `defaultRetryDelay`
+  // would treat that as an explicit "retry immediately", suppressing the very
+  // exponential backoff the empty header gives no reason to skip. Treat it as
+  // absent so the computed backoff stands.
+  if (trimmed === '') return undefined;
+
+  const seconds = Number(trimmed);
   if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
 
   const at = Date.parse(raw);

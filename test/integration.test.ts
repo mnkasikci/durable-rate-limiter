@@ -383,8 +383,10 @@ describe('client + object — durability and its limits', () => {
       async (_instance, state) => state.storage.get<BucketState>('bucket-state')
     );
     expect(stored).toBeDefined();
-    // One grant per paced take, summing to the amount used.
-    expect(stored?.grants).toHaveLength(2);
+    // The persisted log carries the spend, one grant per distinct take-instant
+    // (same-millisecond takes coalesce), summing to the amount used.
+    expect(stored?.grants.length).toBeGreaterThanOrEqual(1);
+    expect(stored?.grants.length).toBeLessThanOrEqual(2);
     expect(stored?.grants.reduce((sum, grant) => sum + grant.amount, 0)).toBe(
       2
     );

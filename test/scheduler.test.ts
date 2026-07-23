@@ -683,6 +683,10 @@ describe('Retry-After', () => {
     ['a non-object source', 'nope'],
     ['no retry information at all', { status: 429 }],
     ['an unparseable value', { headers: { 'Retry-After': 'soon' } }],
+    // `Number('')` is `0`, not `NaN`: an empty or whitespace-only header must
+    // read as absent, not as a 0ms "retry now" that suppresses backoff.
+    ['an empty header value', { headers: { 'Retry-After': '' } }],
+    ['a whitespace-only header value', { headers: { 'Retry-After': '   ' } }],
     ['a non-string header value', { headers: { 'Retry-After': 5 } }],
     ['an absent Headers entry', { headers: new Headers() }],
     [
@@ -740,6 +744,19 @@ describe('Retry-After', () => {
         now,
       })
     ).toBe(100);
+
+    // An empty Retry-After is not an explicit 0ms delay: it must fall through to
+    // the computed backoff, not `pause(0)` and hammer the upstream.
+    expect(
+      defaultRetryDelay({
+        attempt: 3,
+        error: undefined,
+        result: { headers: { 'Retry-After': '' } },
+        isRateLimited: true,
+        retry,
+        now,
+      })
+    ).toBe(400);
   });
 
   it('drives the retry wait from a Retry-After header end to end', async () => {
