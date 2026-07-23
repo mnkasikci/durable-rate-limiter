@@ -18,5 +18,7 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - run: npm run check
+      # Build first: the example/ Workers import the package through `dist/`,
+      # so linting them before a build reports every import as unresolved.
       - run: npm run build
+      - run: npm run check
