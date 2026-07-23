@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { TokenBucket } from '../src/core/bucket.js';
+import { SlidingLogBucket } from '../src/core/bucket.js';
 import {
   CallFailedError,
   DEFAULT_CONCURRENCY,
@@ -192,9 +192,8 @@ describe('backpressure', () => {
   });
 
   it('waits out a rate limit through the real bucket, not a private timer', async () => {
-    const bucket = new TokenBucket({
-      capacity: 5,
-      fillPerWindow: 5,
+    const bucket = new SlidingLogBucket({
+      limitPerWindow: 5,
       windowInMs: 50,
     });
     const scheduler = new Scheduler({
@@ -216,7 +215,7 @@ describe('backpressure', () => {
 });
 
 describe('retry and classification', () => {
-  it('takes a token before every attempt, not just the first', async () => {
+  it('takes from the bucket before every attempt, not just the first', async () => {
     const taken: number[] = [];
     const bucket: Bucket = {
       consumeAsync: (amount) => {

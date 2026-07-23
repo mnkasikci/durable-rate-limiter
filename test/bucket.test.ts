@@ -2,110 +2,115 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   BucketDestroyedError,
-  TokenBucket,
+  SlidingLogBucket,
   type BucketState,
 } from '../src/core/bucket.js';
 
 /**
- * Timing suites use a deliberately fast bucket — 3 tokens per 300ms window, so
- * one token per 100ms — to keep real-timer tests short. Everything that can be
- * asserted without a timer passes `now` in explicitly and is fully
- * deterministic.
+ * Timing suites use a deliberately short window — 3 per 150ms — so a caller
+ * that exhausts a window only waits that long for a grant to age out. Anything
+ * that can be asserted without a timer builds its state through `consume` with
+ * an explicit `now` and is fully deterministic; only the restore and real-timer
+ * suites anchor to `Date.now()`, because the constructor and the queue timer
+ * read the wall clock themselves.
  */
-const FAST = { capacity: 3, fillPerWindow: 3, windowInMs: 300 } as const;
+const FAST = { limitPerWindow: 3, windowInMs: 150 } as const;
+
+/** A log holding one grant that fills the whole window, dated at `at`. */
+function exhausted(at: number = Date.now()): BucketState {
+  return { grants: [{ at, amount: FAST.limitPerWindow }], forcedUntil: 0 };
+}
 
 describe('option validation', () => {
   // Every comparison against NaN is false, so a range check alone accepts it,
   // and a NaN window turns the queue timer into a CPU-burning hot loop.
   it.each([
-    ['capacity', { capacity: NaN, fillPerWindow: 1, windowInMs: 1000 }],
-    ['fillPerWindow', { capacity: 1, fillPerWindow: NaN, windowInMs: 1000 }],
-    ['windowInMs', { capacity: 1, fillPerWindow: 1, windowInMs: NaN }],
-    [
-      'initialTokens',
-      { capacity: 1, fillPerWindow: 1, windowInMs: 1000, initialTokens: NaN },
-    ],
+    ['limitPerWindow', { limitPerWindow: NaN, windowInMs: 1000 }],
+    ['windowInMs', { limitPerWindow: 1, windowInMs: NaN }],
     [
       'penaltyRefillFraction',
-      {
-        capacity: 1,
-        fillPerWindow: 1,
-        windowInMs: 1000,
-        penaltyRefillFraction: NaN,
-      },
+      { limitPerWindow: 1, windowInMs: 1000, penaltyRefillFraction: NaN },
     ],
   ])(
     'throws when %s is NaN rather than silently accepting it',
     (_label, options) => {
-      expect(() => new TokenBucket(options)).toThrow(TypeError);
+      expect(() => new SlidingLogBucket(options)).toThrow(TypeError);
     }
   );
 
   it('throws on Infinity, which range checks also let through unhelpfully', () => {
     expect(
-      () =>
-        new TokenBucket({ capacity: Infinity, fillPerWindow: 1, windowInMs: 1 })
+      () => new SlidingLogBucket({ limitPerWindow: Infinity, windowInMs: 1 })
     ).toThrow(TypeError);
   });
 
   it.each([
-    ['zero capacity', { capacity: 0, fillPerWindow: 1, windowInMs: 1000 }],
-    [
-      'negative fillPerWindow',
-      { capacity: 1, fillPerWindow: -1, windowInMs: 1000 },
-    ],
-    ['zero window', { capacity: 1, fillPerWindow: 1, windowInMs: 0 }],
-    [
-      'initialTokens above capacity',
-      { capacity: 1, fillPerWindow: 1, windowInMs: 10, initialTokens: 2 },
-    ],
+    ['zero limitPerWindow', { limitPerWindow: 0, windowInMs: 1000 }],
+    ['zero window', { limitPerWindow: 1, windowInMs: 0 }],
     [
       'penaltyRefillFraction above 1',
-      {
-        capacity: 1,
-        fillPerWindow: 1,
-        windowInMs: 10,
-        penaltyRefillFraction: 1.5,
-      },
+      { limitPerWindow: 1, windowInMs: 10, penaltyRefillFraction: 1.5 },
     ],
   ])('rejects out-of-range option: %s', (_label, options) => {
-    expect(() => new TokenBucket(options)).toThrow(RangeError);
+    expect(() => new SlidingLogBucket(options)).toThrow(RangeError);
   });
 
-  it('rejects a NaN or out-of-range snapshot, which would poison every later read', () => {
-    const base = { tokens: 1, lastRefillAt: Date.now(), forcedUntil: 0 };
+  it('rejects a NaN forcedUntil or grant field, which would poison every later read', () => {
+    const now = Date.now();
     expect(
-      () => new TokenBucket(FAST, { state: { ...base, tokens: NaN } })
+      () =>
+        new SlidingLogBucket(FAST, {
+          state: { grants: [{ at: now, amount: 1 }], forcedUntil: NaN },
+        })
     ).toThrow(TypeError);
     expect(
-      () => new TokenBucket(FAST, { state: { ...base, lastRefillAt: NaN } })
+      () =>
+        new SlidingLogBucket(FAST, {
+          state: { grants: [{ at: NaN, amount: 1 }], forcedUntil: 0 },
+        })
     ).toThrow(TypeError);
     expect(
-      () => new TokenBucket(FAST, { state: { ...base, forcedUntil: NaN } })
+      () =>
+        new SlidingLogBucket(FAST, {
+          state: { grants: [{ at: now, amount: NaN }], forcedUntil: 0 },
+        })
     ).toThrow(TypeError);
+  });
+
+  it('rejects a non-positive grant amount, which would corrupt the running sum', () => {
+    const now = Date.now();
     expect(
-      () => new TokenBucket(FAST, { state: { ...base, tokens: 99 } })
+      () =>
+        new SlidingLogBucket(FAST, {
+          state: { grants: [{ at: now, amount: 0 }], forcedUntil: 0 },
+        })
+    ).toThrow(RangeError);
+    expect(
+      () =>
+        new SlidingLogBucket(FAST, {
+          state: { grants: [{ at: now, amount: -1 }], forcedUntil: 0 },
+        })
     ).toThrow(RangeError);
   });
 
   it('rejects a non-finite or non-positive consume amount', () => {
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
     expect(() => bucket.consume(NaN)).toThrow(TypeError);
     expect(() => bucket.consume(0)).toThrow(RangeError);
-    // Larger than capacity could never be satisfied; failing loudly beats
-    // hanging forever in consumeAsync.
+    // Larger than the whole window could never be satisfied; failing loudly
+    // beats hanging forever in consumeAsync.
     expect(() => bucket.consume(4)).toThrow(RangeError);
     bucket.destroy();
   });
 
-  it('rejects a non-finite clock reading instead of corrupting the token count', () => {
-    const bucket = new TokenBucket(FAST);
+  it('rejects a non-finite clock reading instead of corrupting the log', () => {
+    const bucket = new SlidingLogBucket(FAST);
     expect(() => bucket.consume(1, NaN)).toThrow(TypeError);
     bucket.destroy();
   });
 
   it('rejects a NaN or negative pause, which would otherwise set forcedUntil to NaN', () => {
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
     expect(() => {
       bucket.pause(NaN);
     }).toThrow(TypeError);
@@ -114,144 +119,165 @@ describe('option validation', () => {
     }).toThrow(RangeError);
     bucket.destroy();
   });
-
-  it('accepts independent capacity and rate: 50/min bursting no more than 10', () => {
-    const t0 = 1_000_000;
-    const bucket = new TokenBucket(
-      { capacity: 10, fillPerWindow: 50, windowInMs: 60_000 },
-      { state: { tokens: 0, lastRefillAt: t0, forcedUntil: 0 } }
-    );
-    // 50/min is 1 token per 1.2s, and the burst never exceeds capacity.
-    expect(bucket.available(t0 + 1200)).toBeCloseTo(1, 6);
-    expect(bucket.available(t0 + 600_000)).toBe(10);
-    bucket.destroy();
-  });
 });
 
-describe('refill', () => {
-  it('is fractional over time, not lumpy at window boundaries', () => {
+describe('the rolling window', () => {
+  it('lets a caller rested a full window spend the whole limit at once', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: t0, forcedUntil: 0 },
+    // The motivating case: 100 per minute must let a rested caller send all 100
+    // immediately — not a fifth of them.
+    const bucket = new SlidingLogBucket({
+      limitPerWindow: 100,
+      windowInMs: 60_000,
     });
 
-    // A lumpy implementation would report 0 for the whole window and then 3.
-    expect(bucket.available(t0 + 50)).toBeCloseTo(0.5, 6);
-    expect(bucket.available(t0 + 100)).toBeCloseTo(1, 6);
-    expect(bucket.available(t0 + 250)).toBeCloseTo(2.5, 6);
+    expect(bucket.consume(100, t0)).toBe(true);
+    // Still inside the window a millisecond before the grants age out.
+    expect(bucket.consume(1, t0 + 59_999)).toBe(false);
+    // One full window on, the log is empty again and the whole limit is free.
+    expect(bucket.available(t0 + 60_000)).toBe(100);
+    expect(bucket.consume(100, t0 + 60_000)).toBe(true);
     bucket.destroy();
   });
 
-  it('never exceeds capacity however long the bucket sat idle', () => {
+  it('never exceeds the limit in any rolling window', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: t0, forcedUntil: 0 },
-    });
-    expect(bucket.available(t0 + 10 * 60 * 1000)).toBe(FAST.capacity);
+    const bucket = new SlidingLogBucket({ limitPerWindow: 3, windowInMs: 300 });
+
+    // Three single takes spread across the window fill it.
+    expect(bucket.consume(1, t0)).toBe(true);
+    expect(bucket.consume(1, t0 + 100)).toBe(true);
+    expect(bucket.consume(1, t0 + 200)).toBe(true);
+
+    // Room reopens grant by grant as each ages out: at t0+300 exactly one grant
+    // — the oldest, dated t0 — has aged out, freeing exactly one take, so no
+    // 300ms span ever holds four.
+    expect(bucket.consume(1, t0 + 299)).toBe(false);
+    expect(bucket.consume(1, t0 + 300)).toBe(true);
+    expect(bucket.consume(1, t0 + 300)).toBe(false);
     bucket.destroy();
   });
 
-  it('does not run backwards when a reading is older than the last refill', () => {
+  it('frees allowance exactly when the oldest grant ages out', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 1, lastRefillAt: t0, forcedUntil: 0 },
-    });
-    expect(bucket.available(t0 - 5000)).toBe(1);
-    expect(bucket.getState(t0).lastRefillAt).toBe(t0);
+    const bucket = new SlidingLogBucket(FAST);
+
+    bucket.consume(2, t0);
+    bucket.consume(1, t0 + 50);
+    expect(bucket.available(t0 + 100)).toBe(0);
+
+    // The amount-2 grant ages out at t0+150; a millisecond before, still nothing.
+    expect(bucket.available(t0 + 149)).toBe(0);
+    expect(bucket.available(t0 + 150)).toBe(2);
+    // The amount-1 grant ages out at t0+200, restoring the whole limit.
+    expect(bucket.available(t0 + 200)).toBe(3);
     bucket.destroy();
   });
 
-  it('restores the right count from a snapshot, not a full bucket', () => {
+  it('keeps a grant that is still inside its window', () => {
     const t0 = 1_000_000;
-    // Evicted with 0 tokens 150ms ago: a cold start must hand out 1.5, not 3.
+    const bucket = new SlidingLogBucket(FAST);
+    bucket.consume(1, t0);
+    // A reading inside the window leaves the grant, and so the usage, in place.
+    expect(bucket.available(t0 + 50)).toBe(2);
+    expect(bucket.getState(t0 + 50).grants).toEqual([{ at: t0, amount: 1 }]);
+    bucket.destroy();
+  });
+
+  it('resumes the log a snapshot was evicted with, not a fresh window', () => {
+    const now = Date.now();
+    // Evicted 50ms into a 150ms window with 2 of 3 spent: a cold start must
+    // resume that log with the grant intact, not open a full window.
     const snapshot: BucketState = {
-      tokens: 0,
-      lastRefillAt: t0 - 150,
+      grants: [{ at: now - 50, amount: 2 }],
       forcedUntil: 0,
     };
-    const bucket = new TokenBucket(FAST, { state: snapshot });
+    const bucket = new SlidingLogBucket(FAST, { state: snapshot });
 
-    expect(bucket.available(t0)).toBeCloseTo(1.5, 6);
-    expect(bucket.consume(2, t0)).toBe(false);
-    expect(bucket.consume(1, t0)).toBe(true);
+    expect(bucket.available(now)).toBe(1);
+    expect(bucket.consume(2, now)).toBe(false);
+    expect(bucket.consume(1, now)).toBe(true);
     bucket.destroy();
   });
 
-  it('defaults a fresh bucket to full capacity and starts the clock now', () => {
-    const before = Date.now();
-    const bucket = new TokenBucket(FAST);
+  it('drops the oldest grants when a snapshot outsizes a shrunken limit', () => {
+    const now = Date.now();
+    // Written under a larger limit: three grants summing 10, restored into a
+    // bucket whose limit is now 3. Keeping them would refuse every take until
+    // enough aged out — a hang. The newest that fit survive; the rest go.
+    const snapshot: BucketState = {
+      grants: [
+        { at: now - 40, amount: 5 },
+        { at: now - 20, amount: 3 },
+        { at: now - 10, amount: 2 },
+      ],
+      forcedUntil: 0,
+    };
+    const bucket = new SlidingLogBucket(FAST, { state: snapshot });
+
+    // 5 + 3 would already overflow, so only the newest amount-2 grant is kept.
+    expect(bucket.getState(now).grants).toEqual([{ at: now - 10, amount: 2 }]);
+    expect(bucket.available(now)).toBe(1);
+    // And it never wedges: the surviving log leaves exactly room for the rest.
+    expect(bucket.consume(1, now)).toBe(true);
+    bucket.destroy();
+  });
+
+  it('defaults a fresh bucket to an empty log and the whole limit', () => {
+    const bucket = new SlidingLogBucket(FAST);
     const state = bucket.getState();
-    expect(state.tokens).toBe(FAST.capacity);
+    expect(state.grants).toEqual([]);
     expect(state.forcedUntil).toBe(0);
-    expect(state.lastRefillAt).toBeGreaterThanOrEqual(before);
-    bucket.destroy();
-  });
-
-  it('honours initialTokens for a bucket that must not start full', () => {
-    const bucket = new TokenBucket({ ...FAST, initialTokens: 1 });
-    expect(bucket.available()).toBe(1);
+    expect(bucket.available()).toBe(FAST.limitPerWindow);
     bucket.destroy();
   });
 });
 
 describe('penalties', () => {
-  it('resumes at the configured fraction of capacity, not at capacity', () => {
+  it('reopens the recovering window at the configured fraction, not full', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket({
-      capacity: 10,
-      fillPerWindow: 10,
+    const bucket = new SlidingLogBucket({
+      limitPerWindow: 10,
       windowInMs: 1000,
     });
 
     bucket.pause(500, t0);
     // Nothing may be taken while the penalty stands...
     expect(bucket.consume(1, t0 + 100)).toBe(false);
-    // ...and when it lifts we are at half capacity, not full. A full burst
-    // aimed at an API that just asked for backoff re-trips it immediately.
+    expect(bucket.available(t0 + 100)).toBe(0);
+    // ...when it lifts the window opens at half the limit, not full...
     expect(bucket.available(t0 + 500)).toBe(5);
+    // ...and the full limit only one window after the penalty's end, when the
+    // synthetic grant itself ages out.
+    expect(bucket.available(t0 + 1500)).toBe(10);
     bucket.destroy();
   });
 
   it('honours penaltyRefillFraction: 0 for callers wanting the strict behaviour', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket({ ...FAST, penaltyRefillFraction: 0 });
+    const bucket = new SlidingLogBucket({ ...FAST, penaltyRefillFraction: 0 });
     bucket.pause(100, t0);
     expect(bucket.available(t0 + 100)).toBe(0);
     bucket.destroy();
   });
 
-  it('accrues no tokens during a penalty window', () => {
+  it('opens no allowance during a penalty however long it stands', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: t0, forcedUntil: 0 },
-    });
+    const bucket = new SlidingLogBucket(FAST, { state: exhausted(t0) });
 
     bucket.pause(1000, t0);
-    // 1000ms is more than three refill windows. If elapsed time were counted
-    // through the penalty the bucket would bank tokens while it is supposed to
-    // be stopped and burst the instant the penalty lifts.
-    expect(bucket.available(t0 + 999)).toBe(1.5);
+    // 1000ms is far longer than the 150ms window. If the log aged through the
+    // penalty it would open a fresh full one and burst the instant the penalty
+    // lifts, defeating the backoff.
+    expect(bucket.available(t0 + 999)).toBe(0);
+    // The synthetic grant the penalty set opens at half the limit when it lifts.
     expect(bucket.available(t0 + 1000)).toBe(1.5);
-    // Accrual restarts from the penalty's end, not from before it began.
-    expect(bucket.available(t0 + 1100)).toBeCloseTo(2.5, 6);
-    bucket.destroy();
-  });
-
-  it('measures elapsed time from the penalty end when a penalty expired between reads', () => {
-    const t0 = 1_000_000;
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: t0, forcedUntil: 0 },
-    });
-    bucket.pause(500, t0);
-    // First read after expiry: 100ms past forcedUntil, so exactly one token on
-    // top of the 1.5 the penalty left. Measuring from t0 would give 6.
-    expect(bucket.available(t0 + 600)).toBeCloseTo(2.5, 6);
     bucket.destroy();
   });
 
   it('waits for the longest of three concurrent penalties, not the first', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
 
     bucket.pause(5000, t0);
     bucket.pause(60_000, t0);
@@ -266,55 +292,91 @@ describe('penalties', () => {
 
   it('does not shorten a standing penalty with a nearer deadline', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
     bucket.pause(60_000, t0);
     bucket.pause(1000, t0 + 10);
     expect(bucket.getState(t0).forcedUntil).toBe(t0 + 60_000);
+    bucket.destroy();
+  });
+
+  it('persists no grant when penaltyRefillFraction is 1, so a restore cannot choke', () => {
+    const t0 = 1_000_000;
+    const bucket = new SlidingLogBucket({ ...FAST, penaltyRefillFraction: 1 });
+    bucket.pause(100, t0);
+    // The whole limit returns the instant the penalty lifts, and a zero-amount
+    // synthetic grant — which a restore rejects for being non-positive — is
+    // never written: an empty log says the same thing.
+    expect(bucket.getState(t0).grants).toEqual([]);
+    expect(bucket.available(t0 + 100)).toBe(FAST.limitPerWindow);
+    bucket.destroy();
+  });
+
+  it('replaces the whole log with the single synthetic grant', () => {
+    const t0 = 1_000_000;
+    const bucket = new SlidingLogBucket(FAST);
+    bucket.consume(1, t0);
+    bucket.consume(1, t0 + 1);
+    bucket.pause(1000, t0 + 2);
+    // The earlier grants are gone: a penalty is a hard reset of the log, not an
+    // addition to it.
+    expect(bucket.getState(t0 + 2).grants).toEqual([
+      { at: t0 + 1002, amount: 1.5 },
+    ]);
     bucket.destroy();
   });
 });
 
 describe('msUntilAvailable', () => {
   it('reports 0 when the amount is already available', () => {
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
     expect(bucket.msUntilAvailable(3)).toBe(0);
     bucket.destroy();
   });
 
-  it('sizes the wait to the exact deficit', () => {
+  it('waits for the oldest grant to age out when the window is spent', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0.5, lastRefillAt: t0, forcedUntil: 0 },
-    });
-    // 2 - 0.5 = 1.5 tokens at 100ms each.
-    expect(bucket.msUntilAvailable(2, t0)).toBe(150);
+    const bucket = new SlidingLogBucket(FAST);
+    bucket.consume(3, t0);
+    // Nothing more this window; the deficit clears when the grant ages out.
+    expect(bucket.msUntilAvailable(1, t0 + 100)).toBe(50);
     bucket.destroy();
   });
 
-  it('adds the penalty remainder to the deficit', () => {
+  it('walks grants oldest-first when freeing one is not enough', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket({ ...FAST, penaltyRefillFraction: 0 });
-    bucket.pause(1000, t0);
-    // Nothing until the penalty lifts, then a full token to accrue.
-    expect(bucket.msUntilAvailable(1, t0 + 400)).toBe(600 + 100);
+    const bucket = new SlidingLogBucket(FAST);
+    bucket.consume(1, t0);
+    bucket.consume(1, t0 + 30);
+    bucket.consume(1, t0 + 60);
+    // Freeing the oldest (t0) leaves 2 used and a request for 2 still overflows,
+    // so the wait runs to the second grant's expiry: t0 + 30 + 150.
+    expect(bucket.msUntilAvailable(2, t0 + 100)).toBe(80);
     bucket.destroy();
   });
 
-  it('returns just the penalty remainder when tokens already cover the amount', () => {
+  it('returns just the penalty remainder when the recovering window covers it', () => {
     const t0 = 1_000_000;
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
     bucket.pause(1000, t0);
-    // 1.5 tokens are banked behind the penalty; only the deadline is in the way.
+    // Half the limit waits behind the penalty; only the deadline is left.
     expect(bucket.msUntilAvailable(1, t0 + 250)).toBe(750);
+    bucket.destroy();
+  });
+
+  it('waits the window after the penalty when the recovering window cannot cover it', () => {
+    const t0 = 1_000_000;
+    const bucket = new SlidingLogBucket({ ...FAST, penaltyRefillFraction: 0 });
+    bucket.pause(1000, t0);
+    // The recovering window opens empty of allowance, so a take waits for the
+    // synthetic grant to age out: the penalty end plus a whole window.
+    expect(bucket.msUntilAvailable(1, t0 + 400)).toBe(1000 + 150 - 400);
     bucket.destroy();
   });
 });
 
 describe('consumeAsync', () => {
-  it('resolves true on a drained bucket rather than ever resolving false', async () => {
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: Date.now(), forcedUntil: 0 },
-    });
+  it('resolves true on a spent window rather than ever resolving false', async () => {
+    const bucket = new SlidingLogBucket(FAST, { state: exhausted() });
 
     // A falsy resolution would force every call site into a `while (!await)` spin.
     await expect(bucket.consumeAsync(3)).resolves.toBe(true);
@@ -322,9 +384,9 @@ describe('consumeAsync', () => {
     bucket.destroy();
   });
 
-  it('resolves synchronously without a timer when tokens are already there', async () => {
+  it('resolves synchronously without a timer when the window has room', async () => {
     const spy = vi.spyOn(globalThis, 'setTimeout');
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
     await expect(bucket.consumeAsync(1)).resolves.toBe(true);
     expect(spy).not.toHaveBeenCalled();
     spy.mockRestore();
@@ -332,9 +394,7 @@ describe('consumeAsync', () => {
   });
 
   it('does not let cheap waiters overtake an expensive head of queue', async () => {
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: Date.now(), forcedUntil: 0 },
-    });
+    const bucket = new SlidingLogBucket(FAST, { state: exhausted() });
 
     const order: string[] = [];
     const expensive = bucket
@@ -352,9 +412,7 @@ describe('consumeAsync', () => {
   });
 
   it('holds waiters through a penalty and releases them after it lifts', async () => {
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: Date.now(), forcedUntil: 0 },
-    });
+    const bucket = new SlidingLogBucket(FAST);
     bucket.pause(150);
 
     const started = Date.now();
@@ -364,7 +422,7 @@ describe('consumeAsync', () => {
   });
 
   it('rejects immediately once the bucket is destroyed', async () => {
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
     bucket.destroy();
     await expect(bucket.consumeAsync(1)).rejects.toBeInstanceOf(
       BucketDestroyedError
@@ -380,9 +438,7 @@ describe('timers', () => {
     const setSpy = vi.spyOn(globalThis, 'setTimeout');
     const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
 
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: Date.now(), forcedUntil: 0 },
-    });
+    const bucket = new SlidingLogBucket(FAST, { state: exhausted() });
     const pending = bucket.consumeAsync(1);
 
     // Asserted across the synchronous window and then unspied, because these
@@ -406,9 +462,7 @@ describe('timers', () => {
 
   it('never schedules a repeating tick', () => {
     const spy = vi.spyOn(globalThis, 'setInterval');
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: Date.now(), forcedUntil: 0 },
-    });
+    const bucket = new SlidingLogBucket(FAST, { state: exhausted() });
     void bucket.consumeAsync(1).catch(() => undefined);
     expect(spy).not.toHaveBeenCalled();
     bucket.destroy();
@@ -416,9 +470,7 @@ describe('timers', () => {
   });
 
   it('reschedules the single timer when a penalty moves the deadline', async () => {
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: Date.now(), forcedUntil: 0 },
-    });
+    const bucket = new SlidingLogBucket(FAST, { state: exhausted() });
     const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
 
     const pending = bucket.consumeAsync(1);
@@ -433,9 +485,7 @@ describe('timers', () => {
 
 describe('destroy', () => {
   it('rejects pending waiters with a distinct error type', async () => {
-    const bucket = new TokenBucket(FAST, {
-      state: { tokens: 0, lastRefillAt: Date.now(), forcedUntil: 0 },
-    });
+    const bucket = new SlidingLogBucket(FAST, { state: exhausted() });
 
     const pending = bucket.consumeAsync(3);
     bucket.destroy();
@@ -447,25 +497,25 @@ describe('destroy', () => {
   });
 
   it('is a no-op the second time, because consumers call it from a finally', () => {
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
     bucket.destroy();
     expect(() => {
       bucket.destroy();
     }).not.toThrow();
   });
 
-  it('refuses further consumption instead of silently handing out tokens', () => {
-    const bucket = new TokenBucket(FAST);
+  it('refuses further consumption instead of silently handing out allowance', () => {
+    const bucket = new SlidingLogBucket(FAST);
     bucket.destroy();
     expect(() => bucket.consume(1)).toThrow(BucketDestroyedError);
   });
 });
 
 describe('state reporting', () => {
-  it('notifies the owner on every mutation of the persistable triple', () => {
+  it('notifies the owner on every mutation of the persistable pair', () => {
     const t0 = 1_000_000;
     const seen: BucketState[] = [];
-    const bucket = new TokenBucket(FAST, {
+    const bucket = new SlidingLogBucket(FAST, {
       onStateChange: (state) => seen.push(state),
     });
 
@@ -473,56 +523,55 @@ describe('state reporting', () => {
     bucket.pause(100, t0);
 
     expect(seen).toHaveLength(2);
-    expect(seen[0]?.tokens).toBe(2);
+    expect(seen[0]?.grants).toEqual([{ at: t0, amount: 1 }]);
     expect(seen[1]?.forcedUntil).toBe(t0 + 100);
     bucket.destroy();
   });
 
+  it('does not notify when the log merely prunes at read time', () => {
+    const now = Date.now();
+    const seen: BucketState[] = [];
+    const bucket = new SlidingLogBucket(FAST, {
+      state: { grants: [{ at: now, amount: 3 }], forcedUntil: 0 },
+      onStateChange: (state) => seen.push(state),
+    });
+    // Ageing a grant out is not a take: reclaiming aged-out room must not write
+    // through, so only a take or a pause emits.
+    bucket.available(now + FAST.windowInMs);
+    expect(seen).toEqual([]);
+    bucket.destroy();
+  });
+
   it('does not notify when a consume is refused', () => {
+    const now = Date.now();
     const onStateChange = vi.fn();
-    const bucket = new TokenBucket(
-      { ...FAST, initialTokens: 0 },
-      { onStateChange }
-    );
-    expect(bucket.consume(3, Date.now())).toBe(false);
+    const bucket = new SlidingLogBucket(FAST, {
+      state: { grants: [{ at: now, amount: 3 }], forcedUntil: 0 },
+      onStateChange,
+    });
+    expect(bucket.consume(3, now)).toBe(false);
     expect(onStateChange).not.toHaveBeenCalled();
     bucket.destroy();
   });
 
   it('works without a callback at all, so the bucket is usable standalone', () => {
-    const bucket = new TokenBucket(FAST);
+    const bucket = new SlidingLogBucket(FAST);
     expect(bucket.consume(1)).toBe(true);
     bucket.destroy();
   });
 
   it('hands out a copy, so an owner cannot mutate the bucket through it', () => {
-    const bucket = new TokenBucket(FAST);
-    const state = bucket.getState();
-    state.tokens = 999;
-    expect(bucket.getState().tokens).toBe(FAST.capacity);
-    bucket.destroy();
-  });
-});
-
-describe('sizing', () => {
-  it('delivers capacity + fillPerWindow in the first rolling window, not fillPerWindow', () => {
     const t0 = 1_000_000;
-    // 4 burst + 4 per 256ms window. Powers of two so the per-token interval is
-    // exact in binary floating point and the count is not an artefact of
-    // rounding.
-    const options = { capacity: 4, fillPerWindow: 4, windowInMs: 256 };
-    const bucket = new TokenBucket(options, {
-      state: { tokens: options.capacity, lastRefillAt: t0, forcedUntil: 0 },
-    });
+    const bucket = new SlidingLogBucket(FAST);
+    bucket.consume(1, t0);
 
-    let delivered = 0;
-    for (let ms = 0; ms <= options.windowInMs; ms += 8) {
-      while (bucket.consume(1, t0 + ms)) delivered++;
-    }
+    const state = bucket.getState(t0);
+    state.grants.push({ at: t0, amount: 1 });
+    const grant = state.grants[0];
+    if (grant !== undefined) grant.amount = 999;
 
-    // The burst is spent immediately and the sustained rate refills on top of
-    // it. Any doc or default implying the rate alone bounds throughput is a bug.
-    expect(delivered).toBe(options.capacity + options.fillPerWindow);
+    // Neither the array nor its entries alias anything inside the bucket.
+    expect(bucket.getState(t0).grants).toEqual([{ at: t0, amount: 1 }]);
     bucket.destroy();
   });
 });

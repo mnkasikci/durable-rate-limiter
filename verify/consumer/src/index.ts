@@ -244,7 +244,7 @@ export default {
       const limiter = limiterFor(env, via, name);
       // Wide-open limits: this measures invocation accounting, not pacing.
       await limiter.configure({
-        bucket: { capacity: 1000, fillPerWindow: 1000, windowInMs: 1000 },
+        bucket: { limitPerWindow: 1000, windowInMs: 1000 },
         concurrency: 50,
       });
 
@@ -300,8 +300,7 @@ export default {
         startAtMs: Date.now() + delaySeconds * 1000,
         // 100 calls at 10 per minute is roughly a 10 minute drain, so the last
         // caller parks well past the ~6 minute mark the design hinges on.
-        capacity: num(q.get('capacity'), 5),
-        fillPerWindow: num(q.get('fillPerWindow'), 10),
+        limitPerWindow: num(q.get('limitPerWindow'), 10),
         windowInMs: num(q.get('windowInMs'), 60_000),
         concurrency: num(q.get('concurrency'), 5),
         simulate429OnCall: num(q.get('simulate429OnCall'), 0),
@@ -309,12 +308,11 @@ export default {
       };
 
       // A fresh probeId is a fresh bucket, so no run inherits another's
-      // tokens or penalty. `configure` also rejects anyone queued, which is
+      // allowance or penalty. `configure` also rejects anyone queued, which is
       // why it happens before the instances exist rather than after.
       await limiterFor(env, via, probeId).configure({
         bucket: {
-          capacity: config.capacity,
-          fillPerWindow: config.fillPerWindow,
+          limitPerWindow: config.limitPerWindow,
           windowInMs: config.windowInMs,
         },
         concurrency: config.concurrency,
@@ -338,7 +336,7 @@ export default {
 
       const total = config.instances * config.callsPerInstance;
       const drainMin =
-        (total / config.fillPerWindow) * (config.windowInMs / 60_000);
+        (total / config.limitPerWindow) * (config.windowInMs / 60_000);
       return text([
         `probe started: ${probeId}`,
         ``,
@@ -346,7 +344,7 @@ export default {
         `  instances           ${String(config.instances)}`,
         `  calls per instance  ${String(config.callsPerInstance)} (steps of ${String(config.callsPerStep)})`,
         `  total calls         ${String(total)}`,
-        `  bucket              capacity ${String(config.capacity)}, fill ${String(config.fillPerWindow)} per ${String(config.windowInMs)} ms`,
+        `  bucket              limitPerWindow ${String(config.limitPerWindow)} per ${String(config.windowInMs)} ms`,
         `  concurrency         ${String(config.concurrency)}`,
         `  hold per call       ${String(config.holdMs)} ms`,
         `  synthetic 429       ${

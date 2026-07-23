@@ -66,7 +66,7 @@ describe('defineBinder', () => {
     await env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName(name)).configure(
       name,
       {
-        bucket: { capacity: 50, fillPerWindow: 5000, windowInMs: 60_000 },
+        bucket: { limitPerWindow: 5000, windowInMs: 60_000 },
         concurrency: 5,
       }
     );

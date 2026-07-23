@@ -1,11 +1,15 @@
 /**
- * The pacing core: a token bucket whose entire persistable surface is the
- * triple `{ tokens, lastRefillAt, forcedUntil }`.
+ * The pacing core: a sliding log whose entire persistable surface is the pair
+ * `{ grants, forcedUntil }`, where `grants` is one entry per successful take.
  *
- * Tokens are not pushed by a ticker. They are computed from elapsed wall-clock
- * time whenever the bucket is read, which is what lets a bucket be evicted,
- * rebuilt from a stored snapshot, and still land on the correct count instead
- * of handing out a full burst against someone else's quota.
+ * A window is not swept by a ticker. Each grant records the instant and amount
+ * it took, and a grant counts against the allowance only while it is younger
+ * than `windowInMs` — so the window that bounds a caller is the *rolling* one
+ * ending at the moment of the read, not a fixed slot anchored to a clock. Stale
+ * grants are pruned lazily whenever the bucket is read, which is what lets a
+ * bucket be evicted, rebuilt from a stored snapshot, and still land on the
+ * correct usage instead of handing out a fresh full allowance against someone
+ * else's quota.
  *
  * Persistence is deliberately not the bucket's concern. It reports mutations
  * through `onStateChange` and lets its owner decide what to do with them, so
@@ -13,42 +17,61 @@
  * imports, no ambient anything but `Date.now()` where a caller declines to
  * pass a clock reading in.
  *
- * ## Sizing: worst-case throughput is `capacity + fillPerWindow`
+ * ## Sizing: set `limitPerWindow` to the upstream limit
  *
- * NOT `fillPerWindow`. The burst is spent immediately and then the sustained
- * rate refills on top of it within the same window: a bucket at 10/min with a
- * burst of 5 delivers 15 calls in the first rolling minute. To stay under an
- * upstream limit `L`, size so that `capacity + fillPerWindow <= L`.
+ * "100 per minute" means a rested caller may spend all 100 at once — the
+ * ecosystem norm, and what the surveyed upstreams themselves enforce. So
+ * `limitPerWindow` maps 1:1 to the advertised limit; the whole allowance is
+ * spendable, with no separate burst knob to configure.
  *
- * `capacity` and `fillPerWindow` are independent knobs. `{capacity: 10,
- * fillPerWindow: 50, windowInMs: 60_000}` — "50 a minute, never more than 10
- * at once" — is valid and is the most useful shape for pacing a real upstream.
+ * The guarantee is two-sided and exact: never more than `limitPerWindow` in ANY
+ * rolling window, and a caller idle for a full window may still spend the whole
+ * limit at once. Because every grant is measured against the rolling window that
+ * ends at the moment of the read, the allowance is bounded continuously — the
+ * most any window can ever hold is `limitPerWindow`, with no wider peak to guard
+ * against.
+ *
+ * ## Cost
+ *
+ * The price of that exactness is state: the persisted log holds up to
+ * `limitPerWindow` entries and is written through once per grant. That is
+ * nothing for limits in the hundreds, which is the range this is built for;
+ * before configuring a limit in the tens of thousands, weigh the per-grant
+ * write and the size of the persisted blob.
  */
+
+/** One successful take: the instant it landed and the amount it took. */
+export interface BucketGrant {
+  /** Epoch ms the take landed. */
+  at: number;
+  /** Amount taken, fractional and strictly positive. */
+  amount: number;
+}
 
 /** The whole persistable surface of a bucket. */
 export interface BucketState {
-  /** Fractional token count. */
-  tokens: number;
-  /** Epoch ms of the last refill computation. */
-  lastRefillAt: number;
+  /**
+   * One entry per take still inside its rolling window, kept sorted ascending
+   * by `at`. A grant counts against the allowance until `at + windowInMs`.
+   */
+  grants: BucketGrant[];
   /** Epoch ms the current penalty expires; `0` means no penalty. */
   forcedUntil: number;
 }
 
 export interface BucketOptions {
-  /** Burst allowance: the most that can ever be taken at once. */
-  capacity: number;
-  /** Sustained rate: tokens added per `windowInMs`, trickled continuously. */
-  fillPerWindow: number;
+  /** The window's whole allowance: the most a rested caller may spend at once. */
+  limitPerWindow: number;
   windowInMs: number;
-  /** Defaults to `capacity`. */
-  initialTokens?: number;
-  /** Fraction of capacity restored when a penalty is applied; default `0.5`. */
+  /**
+   * Fraction of the limit handed back when a penalty lifts; default `0.5`. See
+   * `pause()` for why it is not `1`.
+   */
   penaltyRefillFraction?: number;
 }
 
 export interface BucketInit {
-  /** Called after every mutation of the persistable triple. */
+  /** Called after every mutation of the persistable pair. */
   onStateChange?: (state: BucketState) => void;
   /** A snapshot to reconstruct from, in place of a fresh bucket. */
   state?: BucketState;
@@ -62,7 +85,9 @@ export class BucketDestroyedError extends Error {
   override readonly name = 'BucketDestroyedError';
 
   constructor() {
-    super('Bucket was destroyed while a caller was waiting for tokens.');
+    super(
+      'Bucket was destroyed while a caller was waiting for room in the window.'
+    );
   }
 }
 
@@ -104,15 +129,13 @@ function requireRange(
   }
 }
 
-export class TokenBucket {
-  readonly #capacity: number;
-  readonly #fillPerWindow: number;
+export class SlidingLogBucket {
+  readonly #limitPerWindow: number;
   readonly #windowInMs: number;
   readonly #penaltyRefillFraction: number;
   readonly #onStateChange: ((state: BucketState) => void) | undefined;
 
-  #tokens: number;
-  #lastRefillAt: number;
+  #grants: BucketGrant[];
   #forcedUntil: number;
 
   #queue: Waiter[] = [];
@@ -121,14 +144,8 @@ export class TokenBucket {
 
   constructor(options: BucketOptions, init: BucketInit = {}) {
     requireRange(
-      'capacity',
-      options.capacity,
-      Number.MIN_VALUE,
-      Number.MAX_VALUE
-    );
-    requireRange(
-      'fillPerWindow',
-      options.fillPerWindow,
+      'limitPerWindow',
+      options.limitPerWindow,
       Number.MIN_VALUE,
       Number.MAX_VALUE
     );
@@ -139,59 +156,97 @@ export class TokenBucket {
       Number.MAX_VALUE
     );
 
-    const initialTokens = options.initialTokens ?? options.capacity;
-    requireRange('initialTokens', initialTokens, 0, options.capacity);
-
     const fraction =
       options.penaltyRefillFraction ?? DEFAULT_PENALTY_REFILL_FRACTION;
     requireRange('penaltyRefillFraction', fraction, 0, 1);
 
-    this.#capacity = options.capacity;
-    this.#fillPerWindow = options.fillPerWindow;
+    this.#limitPerWindow = options.limitPerWindow;
     this.#windowInMs = options.windowInMs;
     this.#penaltyRefillFraction = fraction;
     this.#onStateChange = init.onStateChange;
 
     const snapshot = init.state;
     if (snapshot === undefined) {
-      this.#tokens = initialTokens;
-      this.#lastRefillAt = Date.now();
+      this.#grants = [];
       this.#forcedUntil = 0;
     } else {
-      requireRange('state.tokens', snapshot.tokens, 0, options.capacity);
-      requireFinite('state.lastRefillAt', snapshot.lastRefillAt);
       requireFinite('state.forcedUntil', snapshot.forcedUntil);
-      this.#tokens = snapshot.tokens;
-      this.#lastRefillAt = snapshot.lastRefillAt;
+      for (const grant of snapshot.grants) {
+        requireFinite('state.grant.at', grant.at);
+        // Strictly positive: a zero or negative grant is meaningless and would
+        // corrupt the running sum the whole allowance is computed from.
+        requireRange(
+          'state.grant.amount',
+          grant.amount,
+          Number.MIN_VALUE,
+          Number.MAX_VALUE
+        );
+      }
       this.#forcedUntil = snapshot.forcedUntil;
+      this.#grants = this.#restoreGrants(snapshot.grants, Date.now());
     }
   }
 
-  /** A copy of the persistable triple, refilled to `now`. */
-  getState(now: number = Date.now()): BucketState {
-    this.#refill(now);
-    return {
-      tokens: this.#tokens,
-      lastRefillAt: this.#lastRefillAt,
-      forcedUntil: this.#forcedUntil,
-    };
+  /**
+   * Normalises a restored log: sort ascending, drop what has already aged out,
+   * and — if the survivors still exceed the limit because the snapshot was
+   * written under a larger one — drop the OLDEST until they fit.
+   *
+   * A shrunken limit must tighten pacing, never wedge the restore: keeping a
+   * log whose sum exceeds the new limit would make every `consume` refuse until
+   * enough entries aged out, which for a long window is indistinguishable from a
+   * hang. Dropping the oldest is the least surprising loss — those entries are
+   * the closest to expiry anyway.
+   */
+  #restoreGrants(grants: BucketGrant[], now: number): BucketGrant[] {
+    const live = [...grants]
+      .sort((a, b) => a.at - b.at)
+      .filter((grant) => grant.at + this.#windowInMs > now);
+
+    // Keep the newest suffix whose sum fits, walking newest-first; the first
+    // entry that would push the sum over the limit ends the kept range, so
+    // everything older than it is dropped.
+    const kept: BucketGrant[] = [];
+    let sum = 0;
+    for (const grant of [...live].reverse()) {
+      if (sum + grant.amount > this.#limitPerWindow) break;
+      sum += grant.amount;
+      kept.push(grant);
+    }
+    kept.reverse();
+    return kept;
   }
 
-  /** Tokens available right now, fractional. */
+  /** A copy of the persistable pair, pruned to `now`. */
+  getState(now: number = Date.now()): BucketState {
+    this.#prune(now);
+    return this.#snapshot();
+  }
+
+  /** Amount available in the current rolling window right now, fractional. */
   available(now: number = Date.now()): number {
-    this.#refill(now);
-    return this.#tokens;
+    this.#prune(now);
+    if (now < this.#forcedUntil) return 0;
+    return this.#limitPerWindow - this.#used();
   }
 
   /** Takes `amount` if it is available. Never blocks. */
   consume(amount: number, now: number = Date.now()): boolean {
     this.#assertAlive();
     this.#assertAmount(amount);
-    this.#refill(now);
+    this.#prune(now);
 
-    if (now < this.#forcedUntil || this.#tokens < amount) return false;
+    if (
+      now < this.#forcedUntil ||
+      this.#used() + amount > this.#limitPerWindow
+    ) {
+      return false;
+    }
 
-    this.#tokens -= amount;
+    // Every surviving grant has `at <= now` (a future-dated grant only exists
+    // under a penalty, which the guard above already refused), so appending
+    // keeps the log sorted ascending.
+    this.#grants.push({ at: now, amount });
     this.#emit();
     return true;
   }
@@ -213,16 +268,36 @@ export class TokenBucket {
   /** Milliseconds until `amount` can be taken; `0` means now. */
   msUntilAvailable(amount: number, now: number = Date.now()): number {
     this.#assertAmount(amount);
-    this.#refill(now);
+    this.#prune(now);
 
-    const penaltyWait = now < this.#forcedUntil ? this.#forcedUntil - now : 0;
-    const deficit = amount - this.#tokens;
-    if (deficit <= 0) return penaltyWait;
+    const used = this.#used();
 
-    return (
-      penaltyWait +
-      Math.ceil((deficit / this.#fillPerWindow) * this.#windowInMs)
-    );
+    // A penalty freezes the log `pause` set to a single synthetic grant dated
+    // at `forcedUntil`, so the allowance the recovering window opens with is
+    // `limit - used`. If `amount` fits that, only the penalty's end stands
+    // between the caller and the take; otherwise it must also wait for that
+    // synthetic grant to age out, one window past the penalty.
+    if (now < this.#forcedUntil) {
+      return amount <= this.#limitPerWindow - used
+        ? this.#forcedUntil - now
+        : this.#forcedUntil + this.#windowInMs - now;
+    }
+
+    if (used + amount <= this.#limitPerWindow) return 0;
+
+    // The deficit clears as grants age out oldest-first. Walk from the oldest,
+    // freeing each grant's amount, until enough room has opened; that grant's
+    // expiry is the soonest the take can land. Freeing every grant leaves only
+    // `amount`, which `#assertAmount` caps at the limit, so a satisfying grant
+    // always exists — the loop is entered only when the log is non-empty.
+    let freed = 0;
+    let readyAt = now;
+    for (const grant of this.#grants) {
+      freed += grant.amount;
+      readyAt = grant.at + this.#windowInMs;
+      if (used - freed + amount <= this.#limitPerWindow) break;
+    }
+    return readyAt - now;
   }
 
   /**
@@ -232,18 +307,25 @@ export class TokenBucket {
   pause(ms: number, now: number = Date.now()): void {
     this.#assertAlive();
     requireRange('ms', ms, 0, Number.MAX_VALUE);
-    this.#refill(now);
+    this.#prune(now);
 
     // Furthest deadline wins, and we never early-return when a penalty is
     // already active: concurrent deadlines of 5s / 60s / 5s must wait 60
     // seconds, not 5.
     this.#forcedUntil = Math.max(this.#forcedUntil, now + ms);
 
-    // Do not resume at full capacity — a full burst aimed at an API that just
-    // asked for backoff re-trips it immediately. Halving rather than zeroing:
-    // zeroed penalties stack multiplicatively and the recovery curve is far
-    // steeper than the sum of the individual delays.
-    this.#tokens = this.#capacity * this.#penaltyRefillFraction;
+    // The recovering window opens at the penalty's end, and it does not open
+    // full: a whole window aimed at an API that just asked for backoff re-trips
+    // it immediately. The log is replaced with one synthetic grant dated at the
+    // penalty's end and carrying the amount already spent, so the window that
+    // opens then holds `penaltyRefillFraction` of the limit and the full limit
+    // one window later. Half rather than empty — zeroed penalties stack
+    // multiplicatively and the recovery curve is far steeper than the sum of
+    // the individual delays. A zero-amount synthetic grant (fraction `1`) is
+    // simply an empty log: nothing to persist, and nothing a restore could
+    // reject for being non-positive.
+    const spent = this.#limitPerWindow * (1 - this.#penaltyRefillFraction);
+    this.#grants = spent > 0 ? [{ at: this.#forcedUntil, amount: spent }] : [];
 
     this.#emit();
     this.#schedule();
@@ -264,30 +346,28 @@ export class TokenBucket {
   }
 
   /**
-   * Fractional, continuous refill computed at read time.
+   * Drops grants that have aged out of the rolling window, reopening their
+   * allowance at read time.
    *
-   * No accrual during a penalty window: counting elapsed time through a
-   * penalty banks tokens while the bucket is supposed to be stopped, then
-   * bursts the instant the penalty lifts, defeating the penalty entirely.
+   * A grant stops counting once it is `windowInMs` old, so a caller rested past
+   * the newest grant's expiry meets an empty log and may spend the whole limit.
+   * The synthetic penalty grant is dated in the *future* (`forcedUntil`), so it
+   * is never pruned early and the backoff it encodes cannot be thrown away
+   * before it bites. Pruning never emits — reclaiming aged-out room is not a
+   * state change worth persisting, so only `consume` and `pause` write through.
    */
-  #refill(now: number): void {
+  #prune(now: number): void {
     requireFinite('now', now);
+    this.#grants = this.#grants.filter(
+      (grant) => grant.at + this.#windowInMs > now
+    );
+  }
 
-    if (now < this.#forcedUntil) {
-      // Advance the clock, accrue nothing.
-      this.#lastRefillAt = now;
-      return;
-    }
-
-    // Load-bearing: also covers a penalty that expired between two reads, so
-    // the elapsed window begins at the penalty's end and not before it began.
-    const start = Math.max(this.#lastRefillAt, this.#forcedUntil);
-    const elapsed = now - start;
-    if (elapsed > 0) {
-      const gained = (elapsed / this.#windowInMs) * this.#fillPerWindow;
-      this.#tokens = Math.min(this.#capacity, this.#tokens + gained);
-    }
-    this.#lastRefillAt = Math.max(this.#lastRefillAt, now);
+  /** Sum of the surviving grants; assumes the log has already been pruned. */
+  #used(): number {
+    let total = 0;
+    for (const grant of this.#grants) total += grant.amount;
+    return total;
   }
 
   /**
@@ -339,14 +419,21 @@ export class TokenBucket {
   }
 
   #assertAmount(amount: number): void {
-    requireRange('amount', amount, Number.MIN_VALUE, this.#capacity);
+    requireRange('amount', amount, Number.MIN_VALUE, this.#limitPerWindow);
+  }
+
+  /** A defensive copy — the caller must never alias internal state. */
+  #snapshot(): BucketState {
+    return {
+      grants: this.#grants.map((grant) => ({
+        at: grant.at,
+        amount: grant.amount,
+      })),
+      forcedUntil: this.#forcedUntil,
+    };
   }
 
   #emit(): void {
-    this.#onStateChange?.({
-      tokens: this.#tokens,
-      lastRefillAt: this.#lastRefillAt,
-      forcedUntil: this.#forcedUntil,
-    });
+    this.#onStateChange?.(this.#snapshot());
   }
 }

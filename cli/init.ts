@@ -32,7 +32,6 @@ import {
   limiterModuleSource,
   limiterWorkerSource,
   limiterWranglerConfig,
-  sizeBucket,
   toIdentifier,
   type ConfigFormat,
   type Topology,
@@ -347,9 +346,9 @@ export async function init(options: InitOptions): Promise<number> {
     heading('4. Set your limits');
     say(
       dim(
-        'Worst-case throughput is capacity + fillPerWindow — not fillPerWindow.\n' +
-          '  A full bucket drains instantly and then refills over the same window,\n' +
-          '  so both knobs together must fit under the upstream limit.'
+        'limitPerWindow is the upstream limit, verbatim. A rested caller may\n' +
+          '  spend the whole of it at once, and no rolling window ever holds more\n' +
+          '  than that: the pacing is a sliding log, bounded continuously.'
       )
     );
 
@@ -375,12 +374,12 @@ export async function init(options: InitOptions): Promise<number> {
       })
     );
 
-    const bucket = sizeBucket(upstreamLimit, windowInMs);
+    const bucket = { limitPerWindow: upstreamLimit, windowInMs };
     say();
     say(
-      `  ${green('sized')} capacity ${bold(String(bucket.capacity))} + fillPerWindow ${bold(
-        String(bucket.fillPerWindow)
-      )} = ${bold(String(upstreamLimit))} per ${String(windowInMs)} ms — the true worst case.`
+      `  ${green('set')} limitPerWindow ${bold(String(bucket.limitPerWindow))} per ${String(
+        windowInMs
+      )} ms — a rested caller may spend all of it at once.`
     );
 
     if (!configRoute) {

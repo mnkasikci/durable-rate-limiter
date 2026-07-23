@@ -98,14 +98,14 @@ missing. It covers, in order:
    hit. This section now counts only drops the retry could **not** save; the
    ones it did are in COMPLETION.
 3. **Achieved vs configured rate** — the peak number of calls started inside
-   any rolling `windowInMs`, against both `fillPerWindow` and
-   `capacity + fillPerWindow`. A sliding window rather than fixed buckets: a
-   fixed boundary can split a burst in half and report a rate the upstream
-   never saw.
+   any rolling `windowInMs`, against `limitPerWindow`. The limiter is a sliding
+   log, so no rolling window may exceed the limit; the measurement is itself a
+   sliding window rather than fixed buckets, because a fixed boundary can split
+   a burst in half and report a rate the upstream never saw.
 4. **Peak concurrency** — maximum overlap of caller-side work, from a sweep
    over start/end events.
-5. **Final limiter state** — tokens, penalty, active count, the raw persisted
-   triple, and the config actually in effect.
+5. **Final limiter state** — remaining allowance, reset time, penalty, active
+   count, the raw persisted log, and the config actually in effect.
 
 COMPLETION additionally reports **drops the client absorbed** — total drops,
 how many calls were hit, how many recovered, and the drop rate. Without that
@@ -121,15 +121,15 @@ agree on an absolute epoch any better than they agree on elapsed time.
 Reading `/report/:id` before the run finishes is fine and expected — it says
 `INCOMPLETE` and names how many instances have reported.
 
-### Two numbers that surprise people
+### A number that surprises people
 
-**Peak rate exceeds `fillPerWindow`.** A bucket configured at 10 per 60 000 ms
-with a burst of 5 delivers 15 calls in the first rolling minute. That is
-correct token-bucket behaviour — the burst is spent immediately, then the
-sustained rate refills on top of it — but it is not what the configuration
-reads like. To stay under an upstream limit `L`, size so that
-`capacity + fillPerWindow <= L`. The report prints both numbers next to each
-other for exactly this reason.
+**Peak rate reaches `limitPerWindow` but never passes it.** A rested caller may
+spend the whole window at once, so the peak in any rolling `windowInMs` can sit
+right at `limitPerWindow` — which reads like an over-limit burst if you expect
+a smooth trickle. It is not: the sliding log records every take and counts it
+until it is `windowInMs` old, so no rolling window ever holds more than the
+limit. The allowance is bounded continuously; a peak above the configured limit
+in section 3 is a genuine regression, not an expected trade-off.
 
 **Backpressure compounds.** With `&simulate429OnCall=`, one caller's 429 pauses
 the shared bucket for every other caller and everyone queued behind them, with

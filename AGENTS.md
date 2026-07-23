@@ -13,7 +13,7 @@ not serve something in Features.md, it does not belong here.
 ## Repo layout
 
 ```
-src/core/     pure logic — token bucket maths, backoff, Retry-After parsing,
+src/core/     pure logic — sliding-log maths, backoff, Retry-After parsing,
               the envelope types. No I/O, no timers, no ambient clock: time is
               passed in. Everything here is testable outside workerd.
 src/do/       the limiter Worker: the Durable Object class and its entrypoint.
@@ -90,9 +90,10 @@ do not add one, do not fake it with an ID table.
 
 Consequences to preserve:
 
-- bucket state (`{ tokens, lastRefillAt, forcedUntil }`) **is** persisted and is
-  refilled from wall-clock elapsed time at read time, so eviction after 70–140
-  seconds idle reconstructs the _correct_ token count rather than a full bucket;
+- bucket state (`{ grants, forcedUntil }`, one grant per take) **is** persisted
+  and pruned against the wall clock at read time, so eviction after 70–140
+  seconds idle resumes the log with its outstanding grants intact rather than
+  opening a fresh window;
 - the queue of waiting callbacks is not, so a parked caller can be dropped —
   measured at 2.4% of calls (7 of 290, four runs) against a real deployment
   (`verify/`), which is frequent enough that it cannot be left to consumers;
@@ -111,17 +112,25 @@ Consequences to preserve:
   presenting any point in it as a guarantee is false precision. Raising
   `dropRetries` past ~5 buys little for the same reason: what remains is
   correlated failure, which retries cannot fix, while each attempt still
-  consumes a token before it runs;
+  takes from the bucket before it runs;
 - this is documented, not hidden. Keep it in the README's known-limits section.
 
-### 4. Worst-case throughput is `capacity + fillPerWindow`
+### 4. `limitPerWindow` is the upstream limit, and no rolling window exceeds it
 
-Not `fillPerWindow`. A full bucket can drain instantly and then refill over the
-same window. To stay under an upstream limit `L`, sizing must satisfy
-`capacity + fillPerWindow <= L`.
+A rested caller may spend the whole `limitPerWindow` at once — that is the
+contract, and `limitPerWindow` maps 1:1 to the advertised limit. The pacing is a
+sliding log: every take is recorded and counts against the allowance until it is
+`windowInMs` old, so the allowance is measured continuously and no _rolling_
+window ever holds more than `limitPerWindow`. The guarantee is two-sided and
+exact: the rested burst is preserved and the peak in any window is bounded by
+`limitPerWindow`.
 
-Any doc, default, or example that implies the rate alone bounds throughput is a
-bug. Tests asserting the bound must assert the burst case, not the steady state.
+Any doc, default, or example that lets a rolling window exceed `limitPerWindow`,
+or a burst knob holding back a fraction of the limit from a rested caller, is a
+regression. `pause()` feedback (an upstream `429`) still throttles every caller and reopens
+the recovering window at `penaltyRefillFraction` of the limit. Tests asserting
+the bound must assert the strict rolling guarantee — that no rolling window
+exceeds the limit — not merely the steady state.
 
 ### 5. 100% test coverage on everything
 

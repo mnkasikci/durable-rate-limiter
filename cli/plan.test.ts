@@ -16,32 +16,16 @@ import {
   limitsPayload,
   parseLimits,
   sampleLimitsFileSource,
-  sizeBucket,
   toIdentifier,
 } from './plan.js';
 import { endpoint, extractDeployedUrl } from './state.js';
 
-describe('sizeBucket', () => {
-  it('sums to the upstream limit, because the worst case is the sum', () => {
-    for (const limit of [2, 3, 10, 60, 61, 1000]) {
-      const bucket = sizeBucket(limit, 60_000);
-      expect(bucket.capacity + bucket.fillPerWindow).toBe(limit);
-      expect(bucket.capacity).toBeGreaterThanOrEqual(1);
-      expect(bucket.fillPerWindow).toBeGreaterThanOrEqual(1);
-    }
-  });
-
-  it('keeps the burst a minority of the window', () => {
-    expect(sizeBucket(60, 60_000)).toEqual({
-      capacity: 12,
-      fillPerWindow: 48,
-      windowInMs: 60_000,
-    });
-  });
-
-  it('rejects a limit too small to split', () => {
-    expect(isValidUpstreamLimit('1')).toBe(false);
-    expect(isValidUpstreamLimit('2')).toBe(true);
+describe('the upstream limit', () => {
+  it('accepts a whole limit of at least 1, which maps 1:1', () => {
+    // No splitting: "1 per window" is a legal limiter, so 1 is the floor.
+    expect(isValidUpstreamLimit('1')).toBe(true);
+    expect(isValidUpstreamLimit('60')).toBe(true);
+    expect(isValidUpstreamLimit('0')).toBe(false);
     expect(isValidUpstreamLimit('2.5')).toBe(false);
     expect(isValidUpstreamLimit('lots')).toBe(false);
   });
@@ -165,12 +149,12 @@ describe('the limits file', () => {
   const entries = [
     {
       name: 'read-api',
-      bucket: { capacity: 12, fillPerWindow: 48, windowInMs: 60_000 },
+      bucket: { limitPerWindow: 60, windowInMs: 60_000 },
       concurrency: 5,
     },
     {
       name: 'write-api',
-      bucket: { capacity: 6, fillPerWindow: 24, windowInMs: 60_000 },
+      bucket: { limitPerWindow: 30, windowInMs: 60_000 },
       concurrency: 2,
     },
   ];
@@ -213,15 +197,15 @@ describe('the limits file', () => {
   it('collects every problem rather than only the first', () => {
     const parsed = parseLimits(`{
       "limits": {
-        "good": { "bucket": { "capacity": 1, "fillPerWindow": 1, "windowInMs": 1 }, "concurrency": 0 },
-        "also-bad": { "bucket": { "capacity": 0, "fillPerWindow": 1, "windowInMs": 1 }, "concurrency": 1 }
+        "good": { "bucket": { "limitPerWindow": 1, "windowInMs": 1 }, "concurrency": 0 },
+        "also-bad": { "bucket": { "limitPerWindow": 0, "windowInMs": 1 }, "concurrency": 1 }
       }
     }`);
     expect(parsed.ok).toBe(false);
     if (parsed.ok) return;
     expect(parsed.problems).toHaveLength(2);
     expect(parsed.problems[0]).toContain('concurrency');
-    expect(parsed.problems[1]).toContain('capacity');
+    expect(parsed.problems[1]).toContain('limitPerWindow');
   });
 
   it('rejects a file with nothing in it to apply', () => {
@@ -240,12 +224,12 @@ describe('the limits file', () => {
     });
     expect(
       parseLimits(
-        '{ "limits": { " bad name": { "bucket": { "capacity": 1, "fillPerWindow": 1, "windowInMs": 1 }, "concurrency": 1 } } }'
+        '{ "limits": { " bad name": { "bucket": { "limitPerWindow": 1, "windowInMs": 1 }, "concurrency": 1 } } }'
       )
     ).toMatchObject({ ok: false });
     expect(
       parseLimits(
-        '{ "limits": { "a": { "bucket": { "capacity": 1, "fillPerWindow": 1, "windowInMs": 1 }, "concurrency": 1, "retry": 9 } } }'
+        '{ "limits": { "a": { "bucket": { "limitPerWindow": 1, "windowInMs": 1 }, "concurrency": 1, "retry": 9 } } }'
       )
     ).toMatchObject({ ok: false });
   });
@@ -254,7 +238,7 @@ describe('the limits file', () => {
     const payload = limitsPayload(entries);
     expect(Object.keys(payload)).toEqual(['read-api', 'write-api']);
     expect(payload['read-api']).toMatchObject({
-      bucket: { capacity: 12 },
+      bucket: { limitPerWindow: 60 },
       concurrency: 5,
       retry: { maxRetries: 3 },
     });
@@ -307,7 +291,7 @@ describe('generated modules', () => {
   });
 
   it('configures through the stub directly, or the entrypoint by name', () => {
-    const bucket = { capacity: 5, fillPerWindow: 55, windowInMs: 60_000 };
+    const bucket = { limitPerWindow: 60, windowInMs: 60_000 };
     const direct = configureModuleSource({
       topology: 'direct',
       bindingName: 'RATE_LIMITER',
@@ -316,7 +300,7 @@ describe('generated modules', () => {
       concurrency: 5,
     });
     expect(direct).toContain('as unknown as LimiterRpc');
-    expect(direct).toContain('capacity: 5');
+    expect(direct).toContain('limitPerWindow: 60');
 
     const service = configureModuleSource({
       topology: 'service',

@@ -67,7 +67,7 @@ function limiter(name: string): NamedLimiter {
  */
 function roomy(patch: Partial<LimiterConfig> = {}): LimiterConfig {
   return {
-    bucket: { capacity: 50, fillPerWindow: 5000, windowInMs: 60_000 },
+    bucket: { limitPerWindow: 5000, windowInMs: 60_000 },
     concurrency: 5,
     ...patch,
   };
@@ -125,11 +125,11 @@ describe('LimiterDO.execute', () => {
   });
 
   it('paces callers against the shared bucket', async () => {
-    // capacity 2, and refill slow enough that the third call must wait for a
-    // token rather than being handed one that was already there.
+    // A window of 2, so the third call in the same window must wait for it to
+    // roll rather than being handed an allowance that was already spent.
     const stub = limiter('execute-paced');
     await stub.configure({
-      bucket: { capacity: 2, fillPerWindow: 10, windowInMs: 1000 },
+      bucket: { limitPerWindow: 2, windowInMs: 100 },
       concurrency: 5,
     });
 
@@ -140,7 +140,7 @@ describe('LimiterDO.execute', () => {
       stub.execute(async () => ok(3)),
     ]);
 
-    // Two burst tokens are free; the third costs 1/10th of a 1000ms window.
+    // Two spend the window; the third waits for the 100ms window to roll.
     expect(Date.now() - started).toBeGreaterThanOrEqual(90);
   });
 
@@ -400,7 +400,7 @@ describe('LimiterDO.configure', () => {
 
   it('merges a reconfigure patch over what is already in force', async () => {
     const stub = limiter('configure-merge');
-    const bucket = { capacity: 7, fillPerWindow: 11, windowInMs: 60_000 };
+    const bucket = { limitPerWindow: 11, windowInMs: 60_000 };
     await stub.configure({ bucket, concurrency: 9 });
 
     await stub.reconfigure({ concurrency: 1 });
@@ -426,7 +426,7 @@ describe('LimiterDO.configure', () => {
     // must be ready to retry on.
     const stub = limiter('configure-queued');
     await stub.configure({
-      bucket: { capacity: 1, fillPerWindow: 1, windowInMs: 600_000 },
+      bucket: { limitPerWindow: 1, windowInMs: 600_000 },
       concurrency: 5,
     });
 
@@ -443,10 +443,8 @@ describe('LimiterDO.configure', () => {
     await stub.configure(roomy({ concurrency: 4 }));
 
     await expect(
-      stub.configure(
-        roomy({ bucket: { capacity: -1, fillPerWindow: 1, windowInMs: 1 } })
-      )
-    ).rejects.toThrow(/capacity/);
+      stub.configure(roomy({ bucket: { limitPerWindow: -1, windowInMs: 1 } }))
+    ).rejects.toThrow(/limitPerWindow/);
 
     // Still usable on the last good config, rather than wedged on a written one.
     await expect(stub.stats()).resolves.toMatchObject({
@@ -456,21 +454,24 @@ describe('LimiterDO.configure', () => {
 });
 
 describe('LimiterDO.stats', () => {
-  it('reports tokens, the raw triple and the live config', async () => {
+  it('reports the remaining allowance, the raw log and the live config', async () => {
     const stub = limiter('stats-shape');
     await stub.configure(roomy());
     await stub.execute(async () => ok('one'));
 
     const stats = await stub.stats();
-    expect(stats.tokens).toBeGreaterThan(48);
-    expect(stats.tokens).toBeLessThanOrEqual(50);
+    // One call taken out of a 5000 window.
+    expect(stats.remaining).toBe(4999);
+    const grant = stats.state.grants[0];
+    expect(grant?.amount).toBe(1);
+    expect(grant?.at).toBeGreaterThan(0);
+    // resetAt is the newest grant's expiry: the moment the full limit returns.
+    expect(stats.resetAt).toBe((grant?.at ?? 0) + 60_000);
     expect(stats.penalised).toBe(false);
     expect(stats.forcedUntil).toBe(0);
     expect(stats.active).toBe(0);
-    expect(stats.state.lastRefillAt).toBeGreaterThan(0);
     expect(stats.state).toEqual({
-      tokens: stats.tokens,
-      lastRefillAt: stats.state.lastRefillAt,
+      grants: [{ at: grant?.at, amount: 1 }],
       forcedUntil: 0,
     });
     expect(stats.config.concurrency).toBe(5);
@@ -505,7 +506,7 @@ describe('LimiterDO persistence', () => {
   it('writes bucket state through on every take', async () => {
     const stub = limiter('persist-writes');
     await stub.configure({
-      bucket: { capacity: 4, fillPerWindow: 1, windowInMs: 600_000 },
+      bucket: { limitPerWindow: 4, windowInMs: 600_000 },
       concurrency: 5,
     });
     await stub.execute(async () => ok(1));
@@ -514,22 +515,22 @@ describe('LimiterDO persistence', () => {
       stubFor('persist-writes'),
       async (_instance, state) => state.storage.get<BucketState>('bucket-state')
     );
-    expect(stored?.tokens).toBeCloseTo(3, 5);
+    expect(stored?.grants).toHaveLength(1);
+    expect(stored?.grants[0]?.amount).toBe(1);
   });
 
   it('restores a snapshot instead of handing out a fresh burst', async () => {
     // What eviction looks like: state on disk, no runtime in memory. A limiter
-    // that rebuilt at full capacity here would burst against someone else's
-    // quota after every idle period.
+    // that rebuilt with a fresh full window here would burst against someone
+    // else's quota after every idle period.
     const stub = limiter('persist-restore');
     await stub.configure({
-      bucket: { capacity: 10, fillPerWindow: 1, windowInMs: 600_000 },
+      bucket: { limitPerWindow: 10, windowInMs: 600_000 },
       concurrency: 5,
     });
     await runInDurableObject(stubFor('persist-restore'), async (_i, state) => {
       await state.storage.put<BucketState>('bucket-state', {
-        tokens: 2,
-        lastRefillAt: Date.now(),
+        grants: [{ at: Date.now(), amount: 8 }],
         forcedUntil: 0,
       });
     });
@@ -537,8 +538,8 @@ describe('LimiterDO persistence', () => {
     // reconfigure() drops the cached runtime, forcing a restore from storage.
     await stub.reconfigure({ concurrency: 5 });
     const stats = await stub.stats();
-    expect(stats.tokens).toBeGreaterThanOrEqual(2);
-    expect(stats.tokens).toBeLessThan(3);
+    // 8 of 10 already spent in a window that will not roll for ten minutes.
+    expect(stats.remaining).toBe(2);
   });
 
   it('does not wedge permanently on a failed restore', async () => {
@@ -551,12 +552,12 @@ describe('LimiterDO persistence', () => {
       });
 
     await putConfig({
-      bucket: { capacity: 0, fillPerWindow: 1, windowInMs: 1 },
+      bucket: { limitPerWindow: 0, windowInMs: 1 },
       concurrency: 1,
     });
     await expect(
       runInDurableObject(raw, async (instance: LimiterDO) => instance.stats())
-    ).rejects.toThrow(/capacity/);
+    ).rejects.toThrow(/limitPerWindow/);
 
     await putConfig(roomy());
     await expect(
@@ -622,9 +623,9 @@ describe('LimiterDO registry', () => {
     // would have compensated and erased itself.
     await expect(
       limiter('registry-invalid').configure(
-        roomy({ bucket: { capacity: 0, fillPerWindow: 1, windowInMs: 1 } })
+        roomy({ bucket: { limitPerWindow: 0, windowInMs: 1 } })
       )
-    ).rejects.toThrow(/capacity/);
+    ).rejects.toThrow(/limitPerWindow/);
 
     expect(await registry().listNames()).not.toContain('registry-invalid');
     await expect(limiter('registry-invalid').stats()).rejects.toThrow(

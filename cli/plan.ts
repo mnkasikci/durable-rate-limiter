@@ -12,34 +12,21 @@ export type ConfigFormat = 'jsonc' | 'toml';
 /** The file the limits live in, beside the state file in the limiter's folder. */
 export const LIMITS_FILE = 'durable-rate-limiter.limits.jsonc';
 
-export interface BucketPlan {
-  capacity: number;
-  fillPerWindow: number;
-  windowInMs: number;
-}
-
 /**
- * Size a bucket against an upstream limit.
+ * One bucket's limits: the upstream allowance, mapped 1:1.
  *
- * Worst-case throughput is `capacity + fillPerWindow`, not `fillPerWindow` — so
- * the two must sum to the upstream limit, never each equal it. The burst share
- * is a fifth, which reads as "pace at the limit, never more than a fifth of it
- * at once", and is clamped so that both knobs stay at least 1.
+ * `limitPerWindow` is the advertised limit verbatim — "100 per minute" is
+ * `{ limitPerWindow: 100, windowInMs: 60_000 }`. A rested caller may spend all
+ * of it at once; there is no burst knob holding back a share of it.
  */
-export function sizeBucket(
-  upstreamLimit: number,
-  windowInMs: number
-): BucketPlan {
-  const capacity = Math.min(
-    Math.max(Math.floor(upstreamLimit / 5), 1),
-    upstreamLimit - 1
-  );
-  return { capacity, fillPerWindow: upstreamLimit - capacity, windowInMs };
+export interface BucketLimits {
+  limitPerWindow: number;
+  windowInMs: number;
 }
 
 export function isValidUpstreamLimit(raw: string): boolean {
   const n = Number(raw);
-  return Number.isInteger(n) && n >= 2;
+  return Number.isInteger(n) && n >= 1;
 }
 
 export function isValidWindow(raw: string): boolean {
@@ -239,7 +226,7 @@ function authorized(provided: string | null, expected?: string): boolean {
 /** One bucket's limits, as they appear in the limits file. */
 export interface LimitsEntry {
   name: string;
-  bucket: BucketPlan;
+  bucket: BucketLimits;
   concurrency: number;
   retry?: { maxRetries: number; maxDelayInMs: number };
 }
@@ -254,9 +241,10 @@ export interface LimitsFile {
 const DEFAULT_RETRY = { maxRetries: 3, maxDelayInMs: 30_000 };
 
 /** The shared explanation of what these numbers mean and how to get them wrong. */
-const SIZING_NOTE = `// Worst-case throughput is capacity + fillPerWindow — NOT fillPerWindow. A full
-// bucket drains instantly and then refills over the same window, so to stay
-// under an upstream limit L, size these so that capacity + fillPerWindow <= L.
+const SIZING_NOTE = `// limitPerWindow is the upstream limit, verbatim. A rested caller may spend the
+// whole of it at once — "100 per minute" is limitPerWindow 100, windowInMs
+// 60000 — and no rolling window ever holds more than limitPerWindow: the pacing
+// is a sliding log, so the allowance is bounded continuously.
 //
 // One entry per upstream limit. Two endpoints with different quotas are two
 // entries; endpoints sharing a quota share one.`;
@@ -267,8 +255,7 @@ function limitsBody(entries: LimitsEntry[], extra: string[] = []): string {
       const retry = entry.retry ?? DEFAULT_RETRY;
       return `    "${entry.name}": {
       "bucket": {
-        "capacity": ${String(entry.bucket.capacity)},
-        "fillPerWindow": ${String(entry.bucket.fillPerWindow)},
+        "limitPerWindow": ${String(entry.bucket.limitPerWindow)},
         "windowInMs": ${String(entry.bucket.windowInMs)}
       },
       "concurrency": ${String(entry.concurrency)},
@@ -315,12 +302,12 @@ ${limitsBody(entries)}`;
 export const SAMPLE_ENTRIES: LimitsEntry[] = [
   {
     name: 'example-api',
-    bucket: { capacity: 12, fillPerWindow: 48, windowInMs: 60_000 },
+    bucket: { limitPerWindow: 60, windowInMs: 60_000 },
     concurrency: 5,
   },
   {
     name: 'example-search-api',
-    bucket: { capacity: 6, fillPerWindow: 24, windowInMs: 60_000 },
+    bucket: { limitPerWindow: 30, windowInMs: 60_000 },
     concurrency: 2,
   },
 ];
@@ -406,16 +393,12 @@ export function parseLimits(source: string): ParseResult {
       continue;
     }
 
-    const capacity = whole(bucket.capacity, 1);
-    const fillPerWindow = whole(bucket.fillPerWindow, 1);
+    const limitPerWindow = whole(bucket.limitPerWindow, 1);
     const windowInMs = whole(bucket.windowInMs, 1);
     const concurrency = whole(entry.concurrency, 1);
 
-    if (capacity === null)
-      problems.push(at('bucket.capacity must be a whole number >= 1'));
-    if (fillPerWindow === null) {
-      problems.push(at('bucket.fillPerWindow must be a whole number >= 1'));
-    }
+    if (limitPerWindow === null)
+      problems.push(at('bucket.limitPerWindow must be a whole number >= 1'));
     if (windowInMs === null) {
       problems.push(at('bucket.windowInMs must be a whole number >= 1'));
     }
@@ -429,8 +412,7 @@ export function parseLimits(source: string): ParseResult {
     }
 
     if (
-      capacity === null ||
-      fillPerWindow === null ||
+      limitPerWindow === null ||
       windowInMs === null ||
       concurrency === null
     ) {
@@ -439,7 +421,7 @@ export function parseLimits(source: string): ParseResult {
 
     entries.push({
       name,
-      bucket: { capacity, fillPerWindow, windowInMs },
+      bucket: { limitPerWindow, windowInMs },
       concurrency,
       ...(retry === null
         ? {}
@@ -473,7 +455,7 @@ export function limitsPayload(
   entries: LimitsEntry[]
 ): Record<
   string,
-  { bucket: BucketPlan; concurrency: number; retry?: unknown }
+  { bucket: BucketLimits; concurrency: number; retry?: unknown }
 > {
   return Object.fromEntries(
     entries.map((entry) => [
@@ -741,14 +723,13 @@ export function configureModuleSource(options: {
   topology: Topology;
   bindingName: string;
   instanceName: string;
-  bucket: BucketPlan;
+  bucket: BucketLimits;
   concurrency: number;
 }): string {
   const { topology, bindingName, instanceName, bucket } = options;
   const patch = `{
     bucket: {
-      capacity: ${String(bucket.capacity)},
-      fillPerWindow: ${String(bucket.fillPerWindow)},
+      limitPerWindow: ${String(bucket.limitPerWindow)},
       windowInMs: ${String(bucket.windowInMs)},
     },
     concurrency: ${String(options.concurrency)},
@@ -763,7 +744,8 @@ export function configureModuleSource(options: {
 // on. Call this once: from a deploy script, an admin route, or a guarded
 // first-run path.
 //
-// Worst case is capacity + fillPerWindow = ${String(bucket.capacity + bucket.fillPerWindow)} per ${String(bucket.windowInMs)} ms.
+// A rested caller may spend the whole limit at once; no rolling window ever
+// holds more than ${String(bucket.limitPerWindow)} per ${String(bucket.windowInMs)} ms.
 `;
 
   if (topology === 'direct') {

@@ -101,13 +101,12 @@ export async function remote(
       say();
       say(dim(`  From ${shownLimits}:`));
       for (const entry of entries) {
-        const worst = entry.bucket.capacity + entry.bucket.fillPerWindow;
         say(
-          `    ${bold(entry.name.padEnd(20))} ${String(worst)} per ${String(
-            entry.bucket.windowInMs
-          )} ms ${dim(
-            `(capacity ${String(entry.bucket.capacity)} + fillPerWindow ${String(
-              entry.bucket.fillPerWindow
+          `    ${bold(entry.name.padEnd(20))} ${String(
+            entry.bucket.limitPerWindow
+          )} per ${String(entry.bucket.windowInMs)} ms ${dim(
+            `(limitPerWindow ${String(
+              entry.bucket.limitPerWindow
             )}), concurrency ${String(entry.concurrency)}`
           )}`
         );

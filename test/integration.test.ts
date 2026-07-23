@@ -81,7 +81,7 @@ function rawStub(name: string): DurableObjectStub<LimiterDO> {
  */
 function roomy(patch: Partial<LimiterConfig> = {}): LimiterConfig {
   return {
-    bucket: { capacity: 50, fillPerWindow: 5000, windowInMs: 60_000 },
+    bucket: { limitPerWindow: 5000, windowInMs: 60_000 },
     concurrency: 5,
     retry: { minDelayInMs: 10, maxDelayInMs: 5_000 },
     ...patch,
@@ -195,7 +195,7 @@ describe('client + object — enforcement across callers', () => {
     );
 
     // Overlap of the CALLER-side work, which is the thing that actually
-    // consumes upstream capacity. The object knows this only because it awaits
+    // consumes upstream quota. The object knows this only because it awaits
     // the callback: a released-on-start slot would show 6 here.
     expect(peak).toBe(2);
   });
@@ -227,7 +227,7 @@ describe('client + object — enforcement across callers', () => {
     await callerA;
     await expect(callerB).resolves.toBe('b');
 
-    // B had ~50 tokens available. It waited only because A's `Retry-After`
+    // B had the whole window available. It waited only because A's `Retry-After`
     // paused the bucket for everyone.
     expect(Date.now() - startedB).toBeGreaterThan(600);
     expect(attempts).toBe(2);
@@ -271,11 +271,11 @@ describe('client + object — hooks decided here, enforced there', () => {
     // stall every other caller of the same upstream. This can only be observed
     // with both halves live — the object reads `failure` off the envelope, and
     // nothing but the client can put it there.
-    // A bucket that refills once per ten minutes, so the token count after the
+    // A window that does not roll for ten minutes, so the amount used after the
     // test is exactly the number of attempts that were paced.
     const { bound, ctl } = await setup(
       'body-error',
-      roomy({ bucket: { capacity: 50, fillPerWindow: 1, windowInMs: 600_000 } })
+      roomy({ bucket: { limitPerWindow: 50, windowInMs: 600_000 } })
     );
 
     let attempts = 0;
@@ -304,8 +304,8 @@ describe('client + object — hooks decided here, enforced there', () => {
     const stats = await ctl.stats();
     expect(stats.penalised).toBe(false);
     expect(stats.forcedUntil).toBe(0);
-    // One token per attempt: the pacing still applies, the penalty does not.
-    expect(stats.tokens).toBeCloseTo(47, 3);
+    // One take per attempt: the pacing still applies, the penalty does not.
+    expect(stats.remaining).toBe(47);
   });
 
   it('ends the call on a non-retryable body-encoded failure', async () => {
@@ -367,7 +367,7 @@ describe('client + object — durability and its limits', () => {
     const name = uniqueName('evict');
     const ctl = control(name);
     await ctl.configure({
-      bucket: { capacity: 10, fillPerWindow: 1, windowInMs: 600_000 },
+      bucket: { limitPerWindow: 10, windowInMs: 600_000 },
       concurrency: 5,
     });
     const bound = defineLimiter({ binder, name }).for(env);
@@ -376,21 +376,25 @@ describe('client + object — durability and its limits', () => {
     await bound.call(async () => json({ ok: true }), { read: readJson });
 
     // The in-memory field is not the thing that has to survive eviction; the
-    // persisted triple is. Read the object's own storage rather than trusting
+    // persisted log is. Read the object's own storage rather than trusting
     // `stats()`, which would answer from the live bucket either way.
     const stored = await runInDurableObject(
       rawStub(name),
       async (_instance, state) => state.storage.get<BucketState>('bucket-state')
     );
     expect(stored).toBeDefined();
-    expect(stored?.tokens).toBeCloseTo(8, 3);
+    // One grant per paced take, summing to the amount used.
+    expect(stored?.grants).toHaveLength(2);
+    expect(stored?.grants.reduce((sum, grant) => sum + grant.amount, 0)).toBe(
+      2
+    );
 
     // What eviction looks like: state on disk, no runtime in memory.
     // `reconfigure` drops the cached runtime and forces a restore.
     await ctl.reconfigure({});
     const restored = await ctl.stats();
-    expect(restored.tokens).toBeGreaterThanOrEqual(8);
-    expect(restored.tokens).toBeLessThan(9);
+    // Two of ten spent, in a window that will not roll for ten minutes.
+    expect(restored.remaining).toBe(8);
   });
 
   it('rejects a call cleanly when the wait queue is lost and retries are off', async () => {
@@ -400,14 +404,14 @@ describe('client + object — durability and its limits', () => {
     const name = uniqueName('queue-lost');
     const ctl = control(name);
     await ctl.configure({
-      bucket: { capacity: 1, fillPerWindow: 1, windowInMs: 600_000 },
+      bucket: { limitPerWindow: 1, windowInMs: 600_000 },
       concurrency: 5,
     });
     const bound = defineLimiter({ binder, name, dropRetries: 0 }).for(env);
 
     await bound.call(async () => json({ ok: true }), { read: readJson });
 
-    // No tokens left for ten minutes: this one parks in the object's queue.
+    // No allowance left for ten minutes: this one parks in the object's queue.
     const parked = bound.call(async () => json({ ok: true }), {
       read: readJson,
     });
@@ -427,7 +431,7 @@ describe('client + object — durability and its limits', () => {
     const name = uniqueName('queue-lost-retry');
     const ctl = control(name);
     await ctl.configure({
-      bucket: { capacity: 1, fillPerWindow: 1, windowInMs: 600_000 },
+      bucket: { limitPerWindow: 1, windowInMs: 600_000 },
       concurrency: 5,
     });
     const drops: DropEvent[] = [];
@@ -450,9 +454,9 @@ describe('client + object — durability and its limits', () => {
     await sleep(50);
 
     // Same destruction as above — but now the limits it re-queues under have
-    // tokens, so the caller is served instead of being told to go away.
+    // room, so the caller is served instead of being told to go away.
     await ctl.reconfigure({
-      bucket: { capacity: 5, fillPerWindow: 5, windowInMs: 1_000 },
+      bucket: { limitPerWindow: 5, windowInMs: 1_000 },
     });
 
     await expect(parked).resolves.toEqual({ ok: true });

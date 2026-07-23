@@ -32,9 +32,8 @@ A change to it is always a breaking change and is called out explicitly below.
   setup steps interactively: scaffolds the limiter Worker and offers to deploy
   it, inserts the binding into an existing wrangler config (by textual
   insertion, so comments survive), writes the limiter module with the instance
-  name in exactly one place, and sizes the bucket so that
-  `capacity + fillPerWindow` fits under the upstream limit rather than
-  `fillPerWindow` alone. Both topologies are supported. `--yes` takes every
+  name in exactly one place, and writes the upstream limit verbatim as
+  `limitPerWindow`. Both topologies are supported. `--yes` takes every
   default and never deploys. No runtime dependencies.
 - **CLI** — `configure` and `stats`. `configure` is a method on the Durable
   Object, so only a deployed Worker can call it and no `wrangler` command
@@ -86,8 +85,8 @@ A change to it is always a breaking change and is called out explicitly below.
   bucket (cosmetic) rather than a live bucket nobody can see. If the config
   write then fails on a bucket that did not previously exist, the registration
   is compensated and the object erases itself; a failed _restatement_ of an
-  existing bucket changes nothing, since wiping live token state would hand out
-  a full burst. Any name that slips through regardless is pruned the next time
+  existing bucket changes nothing, since wiping its live window state would hand
+  out a full burst. Any name that slips through regardless is pruned the next time
   `stats` walks the list, and a bucket missing from the list re-adds itself from
   its own persisted name — so the registry converges from both directions.
 - `stats()` now reports the `name` it was configured under, read from storage
@@ -120,12 +119,13 @@ First public release. `ENVELOPE_VERSION` 1.
 
 ### Added
 
-- **`./do`** — `LimiterDO`, a Durable Object holding one token bucket, a
+- **`./do`** — `LimiterDO`, a Durable Object holding one sliding-log bucket, a
   concurrency gate and a retry loop for one named upstream. Addressed by
   `idFromName`, so many independent limiters share one class and one binding.
-  Bucket state is the persisted `{ tokens, lastRefillAt, forcedUntil }` triple,
-  refilled from wall-clock elapsed time at read time, so eviction does not
-  reconstruct a full burst.
+  Bucket state is the persisted `{ grants, forcedUntil }` pair, where `grants`
+  is one `{ at, amount }` entry per take, pruned at read time once it is
+  `windowInMs` old — so eviction and rebuild from a snapshot land on the correct
+  usage rather than a fresh full burst.
 - **`./do`** — `LimiterEntrypoint`, a named `WorkerEntrypoint` giving consumers
   a declared RPC interface (`execute`, `configure`, `stats`, `ping`) rather than
   a direct dependency on the object's class name.
@@ -150,17 +150,18 @@ First public release. `ENVELOPE_VERSION` 1.
   with `CallDroppedError`; every drop is reported to `onDrop`, retried or not.
 - **`defineTestBinder`** — an explicit, typed injection point for unit tests
   outside workerd. No allowlisted magic binding names.
-- **`stats()`** — live token count, penalty state, in-flight count and the raw
-  persisted triple.
+- **`stats()`** — remaining window allowance, reset time, penalty state,
+  in-flight count and the raw persisted `{ grants, forcedUntil }` state.
 - **`ping()` / `ENVELOPE_VERSION`** — so skew between the independently deployed
   halves fails loudly instead of mis-limiting silently.
 
 ### Notes
 
-- Worst-case throughput is `capacity + fillPerWindow`, not `fillPerWindow`. Size
-  so that `capacity + fillPerWindow <= L` for an upstream limit `L`.
-- The default config (`capacity: 10`, `fillPerWindow: 50`, `windowInMs: 60_000`,
-  `concurrency: 5`) has a true worst case of exactly 60 calls a minute.
+- `limitPerWindow` is the upstream limit verbatim; a rested caller may spend all
+  of it at once, and no rolling window ever holds more than `limitPerWindow`.
+  `pause()` feedback throttles every caller on a `429`.
+- A limiter has no default config: an unconfigured bucket does not exist and
+  refuses to run, rather than pacing at an invented rate.
 - `defineBinder` and `defineLimiter` are inert, so a configured limiter is safe
   as a module-scope singleton.
 

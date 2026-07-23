@@ -141,13 +141,13 @@ export class NoSuchLimiterError extends Error {
  *
  * Higher than the object's own retry budget of 3, because these attempts are
  * cheap in a way the object's are not: a dropped caller never reached the
- * upstream, so re-queueing costs a token and some waiting rather than a
- * duplicate request.
+ * upstream, so re-queueing costs a take from the bucket and some waiting rather
+ * than a duplicate request.
  *
  * Not higher still. Past roughly this point the residual risk is dominated by
  * correlated failures — a redeploy taking out every parked caller at once —
  * which more attempts cannot fix, while the costs stay real: every attempt
- * consumes a token before it runs, so a retry storm quietly spends upstream
+ * takes from the bucket before it runs, so a retry storm quietly spends upstream
  * quota doing nothing, and each re-queue adds another full wait to a call that
  * has already been unlucky.
  */

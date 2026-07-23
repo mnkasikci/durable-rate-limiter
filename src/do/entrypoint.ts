@@ -129,7 +129,7 @@ export class LimiterEntrypoint
     return this.#stub(name).reconfigure(patch);
   }
 
-  /** Live tokens, penalty state and the raw persisted triple. */
+  /** Remaining window allowance, penalty state and the raw persisted pair. */
   stats(name: string): Promise<LimiterStats> {
     return this.#stub(name).stats();
   }

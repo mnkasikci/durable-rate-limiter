@@ -15,7 +15,7 @@ ${bold('Usage')}
 
 ${bold('Commands')}
   init            Scaffold the limiter Worker, add the binding, write the
-                  limiter module, and size the bucket against your upstream.
+                  limiter module, and set your limit against your upstream.
   configure       Upload the limits file to the limiter. Run this after editing
                   it. Deploys nothing — the limits are not part of the build.
   stats           Read every bucket's live state back.

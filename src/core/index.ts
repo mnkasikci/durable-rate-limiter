@@ -27,8 +27,9 @@ export {
   type StatusClassifierOptions,
 } from './scheduler.js';
 export {
-  TokenBucket,
+  SlidingLogBucket,
   BucketDestroyedError,
+  type BucketGrant,
   type BucketState,
   type BucketOptions,
   type BucketInit,

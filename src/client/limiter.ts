@@ -302,8 +302,8 @@ export function defineLimiter(definition: LimiterDefinition): Limiter {
               // the shared one rather than a local means the next call does
               // not have to rediscover the breakage for itself.
               stub = definition.binder.stubFor(env, definition.name);
-              // No backoff: the retry must re-acquire a token before it can
-              // run, so the bucket's own pacing is already the wait.
+              // No backoff: the retry must take from the bucket again before it
+              // can run, so the bucket's own pacing is already the wait.
             }
           }
         },

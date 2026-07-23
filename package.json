@@ -11,7 +11,7 @@
     "throttle",
     "concurrency",
     "429",
-    "token-bucket",
+    "sliding-window",
     "backpressure"
   ],
   "license": "MIT",

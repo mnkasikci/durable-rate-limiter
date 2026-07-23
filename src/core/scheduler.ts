@@ -26,10 +26,10 @@
 
 /**
  * The slice of the bucket the scheduler depends on. Structural, so a
- * `TokenBucket`, a remote handle, or a test double all satisfy it.
+ * `SlidingLogBucket`, a remote handle, or a test double all satisfy it.
  */
 export interface Bucket {
-  /** Resolves once a token has actually been taken. */
+  /** Resolves once the amount has actually been taken. */
   consumeAsync(amount: number): Promise<true>;
   /** Throttles every caller of this bucket for `ms`. */
   pause(ms: number): void;

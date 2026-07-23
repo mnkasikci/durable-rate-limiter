@@ -174,11 +174,10 @@ export function buildReport(
   const unrecorded = expected - records.length;
 
   const perWindow = peakRolling(ok, config.windowInMs);
-  // Finding: worst-case throughput is `capacity + fillPerWindow`, not
-  // `fillPerWindow`. The burst is spent immediately and the sustained rate
-  // refills on top of it inside the same window. Both numbers are printed
-  // because the gap between them is the whole point.
-  const worstCase = config.capacity + config.fillPerWindow;
+  // Finding: a rested caller may spend the whole `limitPerWindow` at once, and
+  // the sliding log holds no rolling window above it — the allowance is bounded
+  // continuously. So the peak achieved rate is bounded by the configured limit
+  // itself, and that is exactly what this section checks.
   const windowLabel = `${String(config.windowInMs)} ms`;
 
   return [
@@ -191,7 +190,7 @@ export function buildReport(
     `  ${pad('instances')}${String(config.instances)}`,
     `  ${pad('calls per instance')}${String(config.callsPerInstance)} in steps of ${String(config.callsPerStep)}`,
     `  ${pad('total calls')}${String(expected)}`,
-    `  ${pad('bucket')}capacity ${String(config.capacity)}, fill ${String(config.fillPerWindow)} per ${windowLabel}`,
+    `  ${pad('bucket')}limitPerWindow ${String(config.limitPerWindow)} per ${windowLabel}`,
     `  ${pad('concurrency')}${String(config.concurrency)}`,
     `  ${pad('hold per call')}${String(config.holdMs)} ms`,
     `  ${pad('synthetic 429')}${
@@ -266,19 +265,17 @@ export function buildReport(
     `3 — ACHIEVED vs CONFIGURED RATE`,
     `  ${pad('rolling window')}${windowLabel}`,
     `  ${pad('peak achieved')}${String(perWindow)} calls in any rolling window`,
-    `  ${pad('configured sustained')}${String(config.fillPerWindow)} per window`,
-    `  ${pad('configured worst case')}${String(worstCase)} per window  (capacity + fillPerWindow)`,
+    `  ${pad('configured limit')}${String(config.limitPerWindow)} per window`,
     `  ${
-      perWindow <= worstCase
-        ? `VERDICT: within the worst case.`
-        : `VERDICT: OVER the worst case by ${String(perWindow - worstCase)}.`
+      perWindow <= config.limitPerWindow
+        ? `VERDICT: within the limit — no rolling window exceeded it.`
+        : `VERDICT: OVER the limit by ${String(perWindow - config.limitPerWindow)}.`
     }`,
-    ...(perWindow > config.fillPerWindow && perWindow <= worstCase
+    ...(perWindow > config.limitPerWindow
       ? [
-          `  Note: ${String(perWindow)} > the configured fill of ${String(config.fillPerWindow)}. This is correct`,
-          `  token-bucket behaviour — the burst is spent immediately and the`,
-          `  sustained rate refills on top of it — and it is why sizing against`,
-          `  an upstream limit L means capacity + fillPerWindow <= L.`,
+          `  ${String(perWindow)} > the configured limit of ${String(config.limitPerWindow)}. The sliding log`,
+          `  guarantees no rolling window exceeds the limit, so a genuine excess`,
+          `  here is a real regression in the pacing guarantee.`,
         ]
       : []),
     ``,
@@ -288,31 +285,34 @@ export function buildReport(
     `  Measured caller-side, from when each callback fired to when it`,
     `  settled — the object awaits the callback, so in-flight count is real`,
     `  information rather than an approximation of it.`,
-    // The opening burst is where this is actually tested: `capacity` tokens
-    // are released at once, so `capacity` callbacks start together. Once the
-    // burst is spent, tokens arrive every windowInMs/fillPerWindow and calls
-    // can only overlap if they hold longer than that. Saying so stops a low
-    // number being read as a broken cap when it only means the run never
-    // asked the question.
+    // The opening window is where this is actually tested: the whole allowance
+    // of `limitPerWindow` is released at once, so up to that many callbacks
+    // start together. If the allowance is below the concurrency cap, the cap
+    // can never be reached in one window. Saying so stops a low number being
+    // read as a broken cap when it only means the run never asked the question.
     ...(peakConcurrency(ok) < config.concurrency
       ? [
           ``,
-          `  Peak is BELOW the cap, which on its own proves nothing: after the`,
-          `  opening burst of ${String(config.capacity)}, tokens arrive every`,
-          `  ${String(Math.round(config.windowInMs / config.fillPerWindow))} ms and each call holds ${String(config.holdMs)} ms, so calls`,
+          `  Peak is BELOW the cap, which on its own proves nothing: a window`,
+          `  releases its whole allowance of ${String(config.limitPerWindow)} at once, and each call`,
+          `  holds ${String(config.holdMs)} ms, so those overlap. The cap`,
           `  ${
-            config.holdMs > config.windowInMs / config.fillPerWindow
-              ? 'should still overlap — a low peak here is worth explaining.'
-              : 'cannot overlap outside the burst. Raise holdMs above the token'
+            config.limitPerWindow >= config.concurrency && config.holdMs > 0
+              ? 'should be reached in the opening window — a low peak is worth explaining.'
+              : 'cannot be reached: the window allowance is below it. Raise'
           }`,
-          ...(config.holdMs > config.windowInMs / config.fillPerWindow
+          ...(config.limitPerWindow >= config.concurrency && config.holdMs > 0
             ? []
-            : [`  interval to make this section test anything.`]),
+            : [
+                `  limitPerWindow above the concurrency cap to make this section test`,
+                `  anything.`,
+              ]),
         ]
       : []),
     ``,
     `5 — FINAL LIMITER STATE`,
-    `  ${pad('tokens')}${stats.tokens.toFixed(3)}`,
+    `  ${pad('remaining')}${stats.remaining.toFixed(3)}`,
+    `  ${pad('resetAt')}${new Date(stats.resetAt).toISOString()}`,
     `  ${pad('penalised')}${String(stats.penalised)}`,
     `  ${pad('forcedUntil')}${
       stats.forcedUntil === 0
@@ -320,8 +320,8 @@ export function buildReport(
         : new Date(stats.forcedUntil).toISOString()
     }`,
     `  ${pad('active')}${String(stats.active)}`,
-    `  ${pad('persisted state')}tokens ${stats.state.tokens.toFixed(3)}, lastRefillAt ${String(stats.state.lastRefillAt)}, forcedUntil ${String(stats.state.forcedUntil)}`,
-    `  ${pad('effective config')}capacity ${String(stats.config.bucket.capacity)}, fill ${String(stats.config.bucket.fillPerWindow)} per ${String(stats.config.bucket.windowInMs)} ms, concurrency ${String(stats.config.concurrency)}`,
+    `  ${pad('persisted state')}${String(stats.state.grants.length)} grant${stats.state.grants.length === 1 ? '' : 's'} summing ${stats.state.grants.reduce((sum, grant) => sum + grant.amount, 0).toFixed(3)}, forcedUntil ${String(stats.state.forcedUntil)}`,
+    `  ${pad('effective config')}limitPerWindow ${String(stats.config.bucket.limitPerWindow)} per ${String(stats.config.bucket.windowInMs)} ms, concurrency ${String(stats.config.concurrency)}`,
     // A slot is released in a `finally`, so a callback that rejects frees it.
     // A callback that never settles does not — and a caller whose connection
     // died is exactly the case where that could happen. If this persists after

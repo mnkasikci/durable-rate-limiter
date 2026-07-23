@@ -14,7 +14,7 @@ import type { LimiterConfig } from '../src/do/index.js';
  * if the class is ever demoted to a default export.
  */
 const limits: LimiterConfig = {
-  bucket: { capacity: 20, fillPerWindow: 5000, windowInMs: 60_000 },
+  bucket: { limitPerWindow: 5000, windowInMs: 60_000 },
   concurrency: 3,
 };
 
@@ -83,7 +83,7 @@ describe('LimiterEntrypoint', () => {
     }));
 
     const stats = await env.LIMITER.stats('stats-route');
-    expect(stats.tokens).toBeGreaterThan(18);
+    expect(stats.remaining).toBe(4999);
     expect(stats.penalised).toBe(false);
     expect(stats.active).toBe(0);
     expect(stats.state.forcedUntil).toBe(0);

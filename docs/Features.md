@@ -7,13 +7,18 @@ project README.
 
 ## Global rate limiting that actually holds
 
-One token bucket in a Durable Object, shared by every isolate, every Workflow
+One sliding log in a Durable Object, shared by every isolate, every Workflow
 instance, every cron tick, and every application bound to it. In-process
-limiters give each isolate its own bucket — each politely correct, collectively
-over quota by however many isolates are warm. This gives one bucket, full stop.
+limiters give each isolate its own window — each politely correct, collectively
+over quota by however many isolates are warm. This gives one shared allowance,
+full stop.
 
-Worst-case throughput in any window is `capacity + fillPerWindow`. To stay under
-an upstream limit `L`, size so that `capacity + fillPerWindow <= L`.
+Set `limitPerWindow` to the upstream limit, verbatim: a rested caller may spend
+all of it at once, and no rolling window ever holds more than `limitPerWindow`.
+The pacing is a sliding log — every take is recorded and counts against the
+allowance until it is `windowInMs` old — so the allowance is measured
+continuously and the peak in any window is bounded exactly by `limitPerWindow`.
+`pause()` feedback from a real `429` throttles every caller on top of that.
 
 ## Real concurrency limiting
 
@@ -90,8 +95,8 @@ twice.
 
 That makes the retry safe even for non-idempotent work. It is bounded
 (`dropRetries`, default 5), it takes a fresh handle because the old one is what
-broke, and it adds no backoff of its own — a retry must re-acquire a token, so
-the bucket's pacing is already the wait, which also spreads the attempts out in
+broke, and it adds no backoff of its own — a retry must take from the bucket
+again, so the bucket's pacing is already the wait, which also spreads the attempts out in
 time rather than firing them all into one bad window. Once the attempts are spent the call
 rejects with `CallDroppedError`, carrying the attempt count and the original
 transport message.
@@ -111,10 +116,10 @@ export const apiLimiter = defineLimiter({
 
 ## Survives eviction without a burst
 
-Bucket state is a persisted `{ tokens, lastRefillAt, forcedUntil }` triple,
-refilled from wall-clock elapsed time when read. A Durable Object evicted after
-70–140 seconds idle reconstructs at the *correct* token count — not at full
-capacity, which is what an in-memory counter does, precisely when traffic
+Bucket state is a persisted `{ grants, forcedUntil }` log — one grant per take —
+pruned against the wall clock when read. A Durable Object evicted after 70–140
+seconds idle resumes with its outstanding grants intact — not a fresh full
+window, which is what an in-memory counter opens, precisely when traffic
 resumes.
 
 ## Idle limiters cost nothing
@@ -162,7 +167,8 @@ timers at module scope with a failure that appears only at deploy.
 
 ## Observable
 
-`stats()` returns live token count, penalty state, and the raw persisted triple.
+`stats()` returns the remaining window allowance, when it next resets, penalty
+state, and the raw persisted log.
 A shared limiter nobody can inspect is a shared limiter nobody will trust.
 
 ---

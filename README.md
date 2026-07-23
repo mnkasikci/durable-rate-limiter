@@ -9,7 +9,7 @@ const value = await limiter.for(env).call(() => fetch(url, init), {
 });
 ```
 
-One token bucket, shared by every isolate, every Workflow instance, every cron
+One shared window, shared by every isolate, every Workflow instance, every cron
 tick and every application bound to it. `call()` takes a **function**, not a
 request — so the object decides _when_ your work runs while the work itself runs
 _in your isolate_.
@@ -39,23 +39,23 @@ Porting an in-process limiter does not fix it, for two independent reasons:
   `setTimeout`/`setInterval` at module scope, which is the only place a shared
   singleton could sit — and the failure appears **only at deploy**, never
   locally.
-- **In-memory token state is destroyed constantly.** An isolate is discarded
+- **In-memory window state is destroyed constantly.** An isolate is discarded
   between requests; a Durable Object is evicted after 70–140 seconds idle. An
-  in-memory count resets to _full capacity_ on every cold start, handing out a
-  maximum-size burst against someone else's quota precisely when traffic has
+  in-memory count resets to _an empty window_ on every cold start, handing out a
+  fresh full allowance against someone else's quota precisely when traffic has
   just resumed.
 
-So the bucket has to be **state-driven rather than event-driven** — tokens
-derived from a persisted `{ tokens, lastRefillAt, forcedUntil }` triple and
-wall-clock elapsed time at read time — and it has to live somewhere with
-identity and durable storage. On Cloudflare that means a Durable Object: the
+So the window has to be **state-driven rather than event-driven** — its usage
+read from a persisted `{ grants, forcedUntil }` log, one grant per take, pruned
+against the wall clock at read time — and it has to live somewhere with identity
+and durable storage. On Cloudflare that means a Durable Object: the
 only primitive that guarantees a single instance serialising all callers against
 one piece of state.
 
 ### Why a function and not a request
 
 A conventional gateway proxies: you hand over a URL, headers and a body, it
-performs the request when capacity allows. That forces every byte through a
+performs the request when the limit allows. That forces every byte through a
 single-threaded object, requires the gateway to hold your credentials, and makes
 it specific to each upstream's auth and error conventions.
 
@@ -102,8 +102,8 @@ topology is described [below](#the-other-topology-a-service-binding).
 
 > **Or let the CLI do it.** `npx @bakidev/durable-rate-limiter init`, run from
 > your application's root, walks these five steps and writes every file below —
-> including sizing the bucket against your upstream's real limit. It shows each
-> file and command before it acts. [What it does, exactly.](#the-setup-cli)
+> including your upstream's real limit, written verbatim as `limitPerWindow`. It
+> shows each file and command before it acts. [What it does, exactly.](#the-setup-cli)
 
 ### 1. Create the limiter Worker
 
@@ -250,12 +250,12 @@ const stub = env.RATE_LIMITER.getByName('example-api');
 // The config is COMPLETE, not a patch. There is nothing to merge a fragment
 // onto, and a half-specified bucket is exactly what this refuses to create.
 await stub.configure('example-api', {
-  bucket: { capacity: 5, fillPerWindow: 55, windowInMs: 60_000 },
+  bucket: { limitPerWindow: 60, windowInMs: 60_000 },
   concurrency: 5,
   retry: { maxRetries: 3, maxDelayInMs: 30_000 },
 });
 
-console.log(await stub.stats()); // name, live tokens, penalty state, in-flight
+console.log(await stub.stats()); // name, remaining, resetAt, penalty state, in-flight
 
 // To change one knob later, patch it. No name, because an existing bucket is
 // already registered — and it throws if there is nothing there to patch.
@@ -285,14 +285,14 @@ npx @bakidev/durable-rate-limiter init
 It walks the five steps in the order they must happen — the limiter Worker
 first, because a consumer's binding names it — and for each one:
 
-| Step           | What `init` does                                                                                                      |
-| -------------- | --------------------------------------------------------------------------------------------------------------------- |
-| limiter Worker | scaffolds `src/index.ts` and `wrangler.jsonc`                                                                         |
-| binding        | asks which topology, then inserts the binding into your existing config                                               |
-| types          | offers to run `wrangler types`, so `defineBinder` typechecks the binding name                                         |
-| limiter module | writes `src/limiter.ts` with the binder and the instance name — the name written once                                 |
-| limits         | asks your upstream's real limit, sizes `capacity + fillPerWindow` to fit under it, and writes an editable limits file |
-| deploy         | deploys the limiter Worker, sets its guard secret, and applies those limits — the bucket is live before `init` exits  |
+| Step           | What `init` does                                                                                                     |
+| -------------- | -------------------------------------------------------------------------------------------------------------------- |
+| limiter Worker | scaffolds `src/index.ts` and `wrangler.jsonc`                                                                        |
+| binding        | asks which topology, then inserts the binding into your existing config                                              |
+| types          | offers to run `wrangler types`, so `defineBinder` typechecks the binding name                                        |
+| limiter module | writes `src/limiter.ts` with the binder and the instance name — the name written once                                |
+| limits         | asks your upstream's real limit, writes it verbatim as `limitPerWindow`, and writes an editable limits file          |
+| deploy         | deploys the limiter Worker, sets its guard secret, and applies those limits — the bucket is live before `init` exits |
 
 It opens by telling you to commit first, and reports whether your working tree is
 clean, because everything after that is easiest to read as a diff. Nothing is
@@ -318,11 +318,11 @@ beside it:
 {
   "limits": {
     "read-api": {
-      "bucket": { "capacity": 12, "fillPerWindow": 48, "windowInMs": 60000 },
+      "bucket": { "limitPerWindow": 60, "windowInMs": 60000 },
       "concurrency": 5,
     },
     "write-api": {
-      "bucket": { "capacity": 6, "fillPerWindow": 24, "windowInMs": 60000 },
+      "bucket": { "limitPerWindow": 30, "windowInMs": 60000 },
       "concurrency": 2,
     },
   },
@@ -395,28 +395,28 @@ you to call from a deploy script, an admin route, or a guarded first-run path.
 
 ## 🚨 The sizing rule
 
-> ### Worst-case throughput is `capacity + fillPerWindow`.
+> ### Set `limitPerWindow` to the upstream limit, verbatim.
 >
-> **Not `fillPerWindow`.** To stay under an upstream limit `L`, size so that
->
-> ### `capacity + fillPerWindow <= L`
+> "100 per minute" is `{ limitPerWindow: 100, windowInMs: 60_000 }`. A rested
+> caller may spend all of it at once — that is the point, and what the surveyed
+> upstreams themselves enforce.
 
-The burst allowance is spent immediately and then the sustained rate refills on
-top of it, **within the same window**. This is correct token-bucket behaviour,
-and it is not what the configuration reads like.
+And that is the whole of it — the guarantee is exact. The pacing is a
+**sliding log**: every take is recorded and counts against the allowance until it
+is `windowInMs` old, so the allowance is measured continuously and no _rolling_
+window ever holds more than `limitPerWindow`. A rested caller may still spend the
+whole limit at once, and the peak in any window is bounded by `limitPerWindow`
+with nothing to add on top:
 
-Measured against a real deployment: a bucket at `fillPerWindow: 10` per 60 000 ms
-with `capacity: 5` delivered **15 calls in the first rolling 60-second window**.
+| Upstream limit | Config                                       | Steady state | Any rolling window |
+| -------------- | -------------------------------------------- | ------------ | ------------------ |
+| 60 / minute    | `{ limitPerWindow: 60, windowInMs: 60_000 }` | 60 / minute  | never above 60     |
+| 30 / minute    | `{ limitPerWindow: 30, windowInMs: 60_000 }` | 30 / minute  | never above 30     |
 
-| Upstream limit | Config                                                    | True worst case |
-| -------------- | --------------------------------------------------------- | --------------- |
-| 60 / minute    | `{ capacity: 10, fillPerWindow: 50, windowInMs: 60_000 }` | 60 / minute     |
-| 60 / minute    | `{ capacity: 5, fillPerWindow: 45, windowInMs: 60_000 }`  | 50 / minute     |
-| ❌ 60 / minute | `{ capacity: 10, fillPerWindow: 60, windowInMs: 60_000 }` | **70 / minute** |
-
-`capacity` and `fillPerWindow` are independent knobs. `{ capacity: 10, fillPerWindow: 50 }`
-reads as "50 a minute, never more than 10 at once" — the most useful shape for
-pacing a real upstream.
+On top of that guarantee, the same `pause()` feedback a real `429` drives
+throttles **every** caller and reopens the recovering window at half its
+allowance, so a limit tripped upstream damps the next call rather than
+compounding it.
 
 ---
 
@@ -592,9 +592,10 @@ directly to the latency of a call that has already been unlucky once.
 
 ### Global rate limiting that actually holds
 
-One token bucket in a Durable Object, shared by every isolate, every Workflow
-instance, every cron tick, and every application bound to it. Not a bucket per
-isolate. Worst case is `capacity + fillPerWindow` — see
+One sliding log in a Durable Object, shared by every isolate, every Workflow
+instance, every cron tick, and every application bound to it. Not a window per
+isolate. A rested caller may spend the whole limit at once, and no rolling window
+ever holds more than it — the allowance is bounded continuously. See
 [the sizing rule](#-the-sizing-rule).
 
 ### Real concurrency limiting
@@ -616,9 +617,10 @@ a delay must be inferred instead, exponential backoff clamped to a maximum.
 
 Concurrent penalties do not stack: the deadline is the maximum of existing and
 new, so three simultaneous `5s / 60s / 5s` responses wait 60 seconds, not 5. A
-penalty does not resume at full capacity either — it restores
-`penaltyRefillFraction` of it (default `0.5`), because a full burst aimed at an
-API that just asked for backoff re-trips it immediately.
+penalty does not reopen a full window either — it opens the recovering window
+with `penaltyRefillFraction` of the limit already spent (default `0.5`, so half
+available), because a full window aimed at an API that just asked for backoff
+re-trips it immediately.
 
 ### Rate limits and errors hidden in response bodies
 
@@ -666,10 +668,10 @@ for non-idempotent work. [Full detail below.](#dropped-callers-and-why-the-packa
 
 ### Survives eviction without a burst
 
-Bucket state is a persisted `{ tokens, lastRefillAt, forcedUntil }` triple,
-refilled from wall-clock elapsed time when read. An object evicted after 70–140
-seconds idle reconstructs at the _correct_ token count — not at full capacity,
-which is what an in-memory counter does, precisely when traffic resumes.
+Bucket state is a persisted `{ grants, forcedUntil }` log — one grant per take —
+pruned against the wall clock when read. An object evicted after 70–140 seconds
+idle resumes with its outstanding grants intact — not a fresh full window,
+which is what an in-memory counter opens, precisely when traffic resumes.
 
 ### Idle limiters cost nothing
 
@@ -718,9 +720,9 @@ configured limiter can be exported as a module-scope singleton.
 
 ### Observable
 
-`stats()` returns live token count, penalty state, in-flight count and the raw
-persisted triple. A shared limiter nobody can inspect is a shared limiter nobody
-will trust.
+`stats()` returns the remaining window allowance, when it next resets, penalty
+state, in-flight count and the raw persisted log. A shared limiter nobody can
+inspect is a shared limiter nobody will trust.
 
 ### Version skew is loud
 
@@ -770,7 +772,7 @@ for you to make idempotent or reconcile.
 
 The retry takes a fresh stub, because the handle whose connection just broke
 would otherwise repeat the failure instantly. It adds no backoff — a retry must
-re-acquire a token before it runs, so the bucket's own pacing is already the
+take from the bucket again before it runs, so the bucket's own pacing is already the
 wait, which also spreads the attempts out rather than firing them into one bad
 window. When the attempts are spent, the call rejects with `CallDroppedError`,
 carrying `attempts`, `limiter` and the original transport message as `cause`.
@@ -811,8 +813,8 @@ and that figure would be worth very little.
   that is precisely the quantity the exponent assumes.
 
 Beyond about five retries the residual risk is dominated by correlated failures
-that more attempts cannot fix, while the costs stay real — every attempt consumes
-a token before it runs, so a retry storm spends upstream quota doing nothing.
+that more attempts cannot fix, while the costs stay real — every attempt takes
+from the bucket before it runs, so a retry storm spends upstream quota doing nothing.
 Measure your own rate with `onDrop`; that is the number that should inform your
 `dropRetries`.
 
@@ -1051,9 +1053,9 @@ curl "$VERIFY_URL/cap-probe?key=$PROBE_KEY&max=64"            # per-request invo
 curl "$VERIFY_URL/cap-probe?key=$PROBE_KEY&max=64&via=direct"
 
 # The load run: 10 Workflow instances x 10 calls, all stampeding 60s from now at
-# 10/min with a burst of 5 — a ~10 minute drain, so the last caller parks well
-# past the six-minute mark the design hinges on. Prints its probe id.
-curl "$VERIFY_URL/start?key=$PROBE_KEY&instances=10&callsPerInstance=10&capacity=5&fillPerWindow=10&concurrency=5&holdMs=500&delaySeconds=60"
+# 10/min — a ~10 minute drain, so the last caller parks well past the six-minute
+# mark the design hinges on. Prints its probe id.
+curl "$VERIFY_URL/start?key=$PROBE_KEY&instances=10&callsPerInstance=10&limitPerWindow=10&concurrency=5&holdMs=500&delaySeconds=60"
 
 export PROBE_ID=<probe id from the response>
 curl "$VERIFY_URL/report/$PROBE_ID?key=$PROBE_KEY"            # safe to read early

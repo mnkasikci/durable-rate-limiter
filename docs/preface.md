@@ -31,17 +31,17 @@ deploy — and only on deploy, never in local development. Even inside a request
 a pending timer prevents a Durable Object from hibernating, so a "quiet"
 limiter accrues duration charges around the clock.
 
-**In-memory token state is destroyed constantly.** An isolate is discarded
+**In-memory window state is destroyed constantly.** An isolate is discarded
 between requests; a Durable Object is evicted from memory after 70–140 seconds
 of inactivity and its constructor re-runs on the next request. An in-memory
-token count therefore resets to full capacity on every cold start, handing out
-a maximum-size burst against someone else's quota precisely when traffic has
+usage count therefore resets to an empty window on every cold start, handing out
+a fresh full allowance against someone else's quota precisely when traffic has
 just resumed. For a limiter enforcing a third-party limit that is not a
 performance wobble; it is a correctness failure.
 
-So the bucket has to be **state-driven rather than event-driven** — tokens
-derived from a persisted `{tokens, lastRefillAt, forcedUntil}` triple and
-wall-clock elapsed time at read time — and it has to live somewhere with
+So the window has to be **state-driven rather than event-driven** — its usage
+read from a persisted `{grants, forcedUntil}` log, one grant per take, pruned
+against the wall clock at read time — and it has to live somewhere with
 identity and durable storage. On Cloudflare that means a Durable Object: the
 only primitive that guarantees a single instance serialising all callers
 against one piece of state.
@@ -51,7 +51,7 @@ against one piece of state.
 The interesting decision is what a caller sends.
 
 A conventional gateway would proxy: the caller hands over a URL, headers and a
-body, the gateway performs the request when capacity allows, and returns the
+body, the gateway performs the request when the limit allows, and returns the
 response. That forces every byte through a single-threaded object, requires the
 gateway to hold credentials, and makes it specific to each upstream's auth and
 error conventions.

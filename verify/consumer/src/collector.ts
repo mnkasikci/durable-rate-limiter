@@ -71,8 +71,7 @@ export interface ProbeConfig {
   holdMs: number;
   /** The shared instant every instance sleeps until. */
   startAtMs: number;
-  capacity: number;
-  fillPerWindow: number;
+  limitPerWindow: number;
   windowInMs: number;
   concurrency: number;
   /** 1-based call index that answers 429 once; 0 disables. */

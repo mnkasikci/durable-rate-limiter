@@ -4,7 +4,7 @@ import type { LimiterEnv, LimiterRpc } from './entrypoint.js';
 import {
   NO_SUCH_LIMITER,
   Scheduler,
-  TokenBucket,
+  SlidingLogBucket,
   createStatusClassifier,
   defaultRetryDelay,
   readRetryAfterMs,
@@ -146,15 +146,21 @@ export interface LimiterStats {
    * carries no name — see {@link REGISTRY_NAME} and `configure`.
    */
   name: string;
-  /** Live token count, refilled to now. Fractional. */
-  tokens: number;
+  /** Amount left in the current rolling window, pruned to now. `0` under a penalty. */
+  remaining: number;
+  /**
+   * Epoch ms the full limit is next available absent any further takes: the
+   * newest grant's expiry, or `now` when the log is empty and the limit is
+   * already whole.
+   */
+  resetAt: number;
   /** Whether a penalty window is currently in force. */
   penalised: boolean;
   /** Epoch ms the penalty expires; `0` when there is none. */
   forcedUntil: number;
   /** Calls in flight right now. */
   active: number;
-  /** The raw persisted triple. */
+  /** The raw persisted pair. */
   state: BucketState;
   /** The limits actually in effect, after any `configure`. */
   config: LimiterConfig;
@@ -164,7 +170,7 @@ export interface LimiterStats {
 interface Runtime {
   name: string;
   config: LimiterConfig;
-  bucket: TokenBucket;
+  bucket: SlidingLogBucket;
   scheduler: Scheduler<CallReport<unknown>>;
 }
 
@@ -307,7 +313,7 @@ export class LimiterDO extends DurableObject<LimiterEnv> implements LimiterRpc {
    * existed yet, so leaving a half-built one behind serves nobody.
    *
    * That erasure is deliberately limited to creation. A failed *restatement* of
-   * an existing bucket leaves it exactly as it was — wiping live token state
+   * an existing bucket leaves it exactly as it was — wiping the live grant log
    * would hand out a full burst against someone else's quota on the next call,
    * which is the failure this package exists to prevent.
    */
@@ -315,7 +321,7 @@ export class LimiterDO extends DurableObject<LimiterEnv> implements LimiterRpc {
     // Construct before persisting: an invalid bucket shape must fail the
     // caller's `configure` rather than being written and then wedging every
     // later `execute` on a restore that throws.
-    new TokenBucket(config.bucket).destroy();
+    new SlidingLogBucket(config.bucket).destroy();
 
     const existed =
       (await this.ctx.storage.get<LimiterConfig>(CONFIG_KEY)) !== undefined;
@@ -351,7 +357,7 @@ export class LimiterDO extends DurableObject<LimiterEnv> implements LimiterRpc {
     if (stored === undefined) throw new LimiterNotConfiguredError();
 
     const next: LimiterConfig = { ...stored, ...patch };
-    new TokenBucket(next.bucket).destroy();
+    new SlidingLogBucket(next.bucket).destroy();
 
     await this.ctx.storage.put(CONFIG_KEY, next);
     await this.#invalidate();
@@ -365,13 +371,18 @@ export class LimiterDO extends DurableObject<LimiterEnv> implements LimiterRpc {
   async stats(): Promise<LimiterStats> {
     const { name, bucket, scheduler, config } = await this.#ready();
     // One clock reading for the whole answer: Date.now() is frozen between
-    // I/O anyway, and two readings would let `tokens` and `penalised`
+    // I/O anyway, and two readings would let `remaining` and `penalised`
     // disagree about which instant they describe.
     const now = Date.now();
     const state = bucket.getState(now);
+    // The full limit returns once the newest outstanding grant ages out; an
+    // empty log means it is already whole, so `resetAt` is simply now.
+    const newest = state.grants[state.grants.length - 1];
     return {
       name,
-      tokens: state.tokens,
+      remaining: bucket.available(now),
+      resetAt:
+        newest === undefined ? now : newest.at + config.bucket.windowInMs,
       penalised: state.forcedUntil > now,
       forcedUntil: state.forcedUntil,
       active: scheduler.active,
@@ -486,14 +497,14 @@ export class LimiterDO extends DurableObject<LimiterEnv> implements LimiterRpc {
 
     this.#reregister(name);
 
-    const bucket = new TokenBucket(config.bucket, {
-      // A restored snapshot refills from wall-clock elapsed time at read time,
-      // so an evicted limiter comes back with the token count it should have
-      // rather than a fresh burst aimed at someone else's quota.
+    const bucket = new SlidingLogBucket(config.bucket, {
+      // A restored snapshot resumes the log it held — the same grants, aged
+      // against the wall clock — so an evicted limiter comes back mid-window
+      // rather than opening a fresh full one against someone else's quota.
       ...(storedState === undefined ? {} : { state: storedState }),
       // Write-through on every mutation. DO output gates coalesce these, but
-      // it is still a write per token taken — measure before assuming it is
-      // free.
+      // it is still a write per grant taken, and the blob grows with the log —
+      // measure before assuming it is free.
       onStateChange: (state) => {
         void this.ctx.storage.put(STATE_KEY, state);
       },
