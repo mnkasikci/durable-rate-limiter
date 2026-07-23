@@ -72,8 +72,6 @@ npx wrangler delete --config verify/limiter/wrangler.jsonc
 
 ## 3. Documentation
 
-- [ ] `CHANGELOG.md` has an entry for this version, dated, with the compare link
-      updated.
 - [ ] Any changed behaviour is reflected in `README.md` — in particular the
       sizing rule, the anti-patterns, and the known limits.
 - [ ] **No compounded drop probability appears anywhere.** The base rate is a
@@ -87,7 +85,7 @@ npx wrangler delete --config verify/limiter/wrangler.jsonc
 ## 4. Package contents
 
 - [ ] `npm pack --dry-run` — the tarball contains `dist/`, `README.md`,
-      `LICENSE`, `CHANGELOG.md` and `package.json`, and nothing else. No `src/`,
+      `LICENSE` and `package.json`, and nothing else. No `src/`,
       no `test/`, no `verify/`, no `.wrangler/`, no coverage output.
 - [ ] Both subpath exports resolve:
 
@@ -100,7 +98,7 @@ npx wrangler delete --config verify/limiter/wrangler.jsonc
   is expected and is why it is `external` in `tsup.config.ts`. The check that
   matters is that `dist/client.js` loads and exports what it should.
 
-- [ ] `version` bumped in `package.json` and consistent with the CHANGELOG.
+- [ ] `version` bumped in `package.json`.
 
 ## 5. Publish
 
@@ -117,7 +115,7 @@ it from `package.json`.
 ## 6. After
 
 - [ ] `git tag v<version> && git push --tags`.
-- [ ] GitHub release, body taken from the CHANGELOG entry.
+- [ ] GitHub release, body summarising the notable changes in this version.
 - [ ] Verify the published tarball installs and typechecks in a scratch Worker
       project, using the quickstart from the README verbatim. The quickstart is
       the most-read code in the package and the least-tested.

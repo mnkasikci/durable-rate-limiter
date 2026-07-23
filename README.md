@@ -1088,7 +1088,7 @@ npm run build
 ```
 
 Contributor notes, invariants and repo layout: [AGENTS.md](AGENTS.md). Release
-process: [PUBLISHING.md](PUBLISHING.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+process: [PUBLISHING.md](PUBLISHING.md).
 
 ## License
 
