@@ -29,7 +29,7 @@ its own terms:
       native V8 coverage does not work inside workerd, so do not "fix" a
       coverage failure by switching provider.
 - [ ] **Build clean.** `npm run build` produces `dist/do.*` and `dist/client.*`
-      with declarations and sourcemaps.
+      with declarations (no sourcemaps — dropped from the published build).
 
 ## 2. Deployed verification — must be run against a real deployment
 
