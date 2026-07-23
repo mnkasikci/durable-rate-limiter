@@ -94,8 +94,8 @@ costs. And there is no hard wall-clock limit on a request while the caller stays
 connected.
 
 A callback parked for **23 minutes** in production still fired, with no drops
-across a hundred calls from ten independent Workflow instances. See
-`findings.md`.
+across a hundred calls from ten independent Workflow instances. See the deployed
+verification harness in `verify/`.
 
 ## What it is not
 

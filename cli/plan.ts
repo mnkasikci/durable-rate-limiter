@@ -7,7 +7,18 @@
  */
 
 export type Topology = 'direct' | 'service';
-export type ConfigFormat = 'jsonc' | 'toml';
+export type ConfigFormat = 'jsonc' | 'json' | 'toml';
+
+/**
+ * The lowest `compatibility_date` the generated limiter Worker needs.
+ *
+ * Workers RPC / `WorkerEntrypoint` — the only platform feature the DO relies on
+ * — is available from `2024-04-03`. SQLite-backed Durable Objects are gated by
+ * the `new_sqlite_classes` migration, not by a compatibility date, so nothing
+ * pushes the floor higher. Generating at the floor keeps the scaffold deployable
+ * on the widest range of runtimes; a user may raise it to any later date.
+ */
+export const COMPATIBILITY_DATE_FLOOR = '2024-04-03';
 
 /** The file the limits live in, beside the state file in the limiter's folder. */
 export const LIMITS_FILE = 'durable-rate-limiter.limits.jsonc';
@@ -590,6 +601,32 @@ script_name = "${workerName}"
 binding = "${bindingName}"
 service = "${workerName}"
 entrypoint = "LimiterEntrypoint"
+`;
+  }
+
+  // Strict `.json`: no `//` comments and no trailing commas anywhere inside the
+  // inserted block. The single trailing comma after the top-level property is a
+  // separator from the existing keys that follow it (the fragment is inserted
+  // right after the opening brace), so it stays and the file remains valid JSON.
+  if (format === 'json') {
+    return topology === 'direct'
+      ? `  "durable_objects": {
+    "bindings": [
+      {
+        "name": "${bindingName}",
+        "class_name": "LimiterDO",
+        "script_name": "${workerName}"
+      }
+    ]
+  },
+`
+      : `  "services": [
+    {
+      "binding": "${bindingName}",
+      "service": "${workerName}",
+      "entrypoint": "LimiterEntrypoint"
+    }
+  ],
 `;
   }
 

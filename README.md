@@ -92,6 +92,27 @@ Two subpath exports:
 
 Both are built from one shared envelope definition, so the halves cannot drift.
 
+### Requirements
+
+- **Workers types.** The published type surface references ambient Workers types
+  (`DurableObjectNamespace`, `DurableObjectStub`, `DurableObjectId`). They are
+  declared as an **optional** `peerDependency` on `@cloudflare/workers-types`
+  (`>=4`): a project that types its runtime through wrangler's generated
+  `worker-configuration.d.ts` already has them and needs nothing, and a project
+  that does not gets a clear install hint instead of bare "cannot find name"
+  errors. Install it if you see those errors: `npm i -D @cloudflare/workers-types`.
+- **Module resolution.** `moduleResolution: "bundler"` (or `"nodenext"`) is
+  recommended and resolves the subpath exports directly. For older TS configs on
+  classic `moduleResolution: "node"`, a `typesVersions` map is shipped as a
+  fallback so `/do` and `/client` still resolve their declarations. The package
+  is subpath-only by design — there is no root `.` import.
+- **`compatibility_date`.** The floor is **`2024-04-03`** — the date Workers RPC
+  (`WorkerEntrypoint`) became available, which is the only platform feature the
+  limiter depends on. SQLite-backed Durable Objects are enabled by the
+  `new_sqlite_classes` migration, not by a compatibility date. Any date at or
+  after the floor works; the CLI scaffolds at the floor for maximum
+  compatibility, and you may raise it.
+
 ---
 
 ## TL;DR — setup in five steps
@@ -126,7 +147,7 @@ export default {
 {
   "name": "my-limiter",
   "main": "src/index.ts",
-  "compatibility_date": "2025-07-01",
+  "compatibility_date": "2024-04-03", // floor; any later date works too
   "durable_objects": {
     "bindings": [{ "name": "RATE_LIMITER", "class_name": "LimiterDO" }],
   },
@@ -240,7 +261,7 @@ rejects anyone currently queued.
 
 ```ts
 // Run once — from a deploy script, an admin route, or a guarded first-run path.
-const stub = env.RATE_LIMITER.getByName('example-api');
+const stub = env.RATE_LIMITER.get(env.RATE_LIMITER.idFromName('example-api'));
 
 // The name goes in twice on purpose: once to address the object, once so the
 // object knows what it is called. It cannot work that out for itself —
@@ -617,10 +638,12 @@ a delay must be inferred instead, exponential backoff clamped to a maximum.
 
 Concurrent penalties do not stack: the deadline is the maximum of existing and
 new, so three simultaneous `5s / 60s / 5s` responses wait 60 seconds, not 5. A
-penalty does not reopen a full window either — it opens the recovering window
-with `penaltyRefillFraction` of the limit already spent (default `0.5`, so half
-available), because a full window aimed at an API that just asked for backoff
-re-trips it immediately.
+penalty does not reopen a full window either — it sets a floor on the spend the
+recovering window carries, leaving at most `penaltyRefillFraction` of the limit
+available (default `0.5`, so half), because a full window aimed at an API that
+just asked for backoff re-trips it immediately. It is a floor, not a reset: real
+takes from before the penalty that are still inside their window keep counting,
+so the window can open with less than that available but never more.
 
 ### Rate limits and errors hidden in response bodies
 
@@ -922,7 +945,10 @@ declare global {
   }
 }
 
-await env.LIMITER.configure('example-api', { concurrency: 5 });
+await env.LIMITER.configure('example-api', {
+  bucket: { limitPerWindow: 60, windowInMs: 60_000 },
+  concurrency: 5,
+});
 const stats = await env.LIMITER.stats('example-api');
 ```
 
@@ -980,9 +1006,13 @@ does exactly that.
 Types: `Binder`, `Limiter`, `BoundLimiter`, `LimiterDefinition`, `CallOptions`,
 `DropEvent`, `DropHook`, `RateLimitHook`, `RateLimitSignal`, `ErrorHook`,
 `FailureDescription`, `HookSlot`, `CallReport`, `LimiterStub`, `NamespaceLike`,
-`DoBindings`, `ENVELOPE_VERSION`, plus `NO_SUCH_LIMITER` and `isNoSuchLimiter`
-— the shared marker that lets the client tell a missing bucket from a dropped
-caller across an RPC boundary that erases error types.
+`DoBindings`, and `ENVELOPE_VERSION`.
+
+Telling a missing bucket from a caller dropped in transit is done for you: the
+client raises `NoSuchLimiterError` (permanent, never retried) rather than
+`CallDroppedError` (transient, retried) across an RPC boundary that erases error
+types. The wire marker behind that decision is an internal envelope detail and
+is deliberately not part of the client's public surface.
 
 ### `@bakidev/durable-rate-limiter/do`
 

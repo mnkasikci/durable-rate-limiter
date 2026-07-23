@@ -16,6 +16,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 import {
+  COMPATIBILITY_DATE_FLOOR,
   LIMITS_FILE,
   bindingFragment,
   configureModuleSource,
@@ -157,7 +158,13 @@ export async function init(options: InitOptions): Promise<number> {
     );
 
     const limiterRoot = path.resolve(cwd, limiterDir);
-    const compatibilityDate = new Date().toISOString().slice(0, 10);
+    // The floor the limiter actually needs: Workers RPC / WorkerEntrypoint is
+    // available from 2024-04-03, and nothing in the package needs anything newer
+    // (SQLite-backed DOs are gated by the `new_sqlite_classes` migration, not by
+    // a compatibility date). Defaulting to the floor maximises the range of
+    // runtimes the generated limiter Worker can deploy to; users may raise it to
+    // any date they prefer.
+    const compatibilityDate = COMPATIBILITY_DATE_FLOOR;
 
     const wroteSource = await writeIfAllowed(
       prompter,
@@ -219,9 +226,14 @@ export async function init(options: InitOptions): Promise<number> {
 
     const consumerConfig = path.resolve(cwd, consumerConfigPath);
     const consumerDir = path.dirname(consumerConfig);
+    // `.json` is strict JSON — no comments, no trailing commas — so it gets a
+    // comment-free fragment. `.jsonc` (and anything else) keeps the annotated
+    // one. `.jsonc` does not match `.endsWith('.json')`, so ordering is safe.
     const format: ConfigFormat = consumerConfig.endsWith('.toml')
       ? 'toml'
-      : 'jsonc';
+      : consumerConfig.endsWith('.json')
+        ? 'json'
+        : 'jsonc';
 
     const bindingName = await prompter.ask('Binding name?', {
       default: topology === 'direct' ? 'RATE_LIMITER' : 'LIMITER',

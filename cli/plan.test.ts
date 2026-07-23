@@ -337,6 +337,34 @@ describe('editing an existing config', () => {
     );
   });
 
+  it('emits strict JSON — no comments, no trailing commas — for a .json target', () => {
+    // A `.json` wrangler config is parsed strictly by tooling other than
+    // wrangler, so the inserted block must survive `JSON.parse`.
+    const strict = `{\n  "name": "app",\n  "main": "src/index.ts"\n}\n`;
+
+    for (const topology of ['direct', 'service'] as const) {
+      const fragment = bindingFragment({
+        topology,
+        format: 'json',
+        bindingName: 'RATE_LIMITER',
+        workerName: 'my-limiter',
+      });
+      expect(fragment).not.toContain('//');
+      // No trailing comma: nothing sits directly before a closing brace/bracket.
+      expect(fragment).not.toMatch(/,\s*[}\]]/);
+
+      const result = insertFragment(strict, fragment, 'json');
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // The whole point: the edited file is still valid strict JSON.
+      const parsed = JSON.parse(result.text) as Record<string, unknown>;
+      expect(parsed.name).toBe('app');
+      expect(
+        topology === 'direct' ? parsed.durable_objects : parsed.services
+      ).toBeDefined();
+    }
+  });
+
   it('appends to TOML, where order does not matter', () => {
     const result = insertFragment('name = "app"\n', '[[services]]\n', 'toml');
     expect(result.ok).toBe(true);

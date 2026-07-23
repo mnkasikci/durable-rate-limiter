@@ -12,7 +12,10 @@ export default defineConfig([
     target: 'es2022',
     platform: 'neutral',
     dts: true,
-    sourcemap: true,
+    // No sourcemaps in the published build: the dist output is plain, unminified
+    // ESM that reads as-is, and external maps would reference `src/**` paths the
+    // `files` whitelist excludes from the tarball — dangling for consumers.
+    sourcemap: false,
     clean: false,
     treeshake: true,
     splitting: false,
@@ -27,7 +30,9 @@ export default defineConfig([
     // `build` script wipes `dist` once, before tsup starts.
     entry: { cli: 'cli/index.ts' },
     format: ['esm'],
-    target: 'node20',
+    // Matches `engines.node`: the CLI uses only APIs available on Node 18
+    // (global fetch, node:readline/promises, createRequire).
+    target: 'node18',
     platform: 'node',
     banner: { js: '#!/usr/bin/env node' },
     dts: false,
