@@ -6,6 +6,12 @@ export default defineWorkersConfig({
     // node:child_process, which do not resolve inside workerd — and runs under
     // vitest.cli.config.ts instead.
     include: ['test/**/*.test.ts'],
+    // Drops workerd's info-level "uncaught exception" traces for rejections the
+    // suites deliberately await. See the file for exactly what it keeps; run
+    // with DRL_WORKERD_LOGS=1 to skip it and read the raw runtime log.
+    globalSetup: process.env.DRL_WORKERD_LOGS
+      ? []
+      : ['./test/quiet-workerd.ts'],
     poolOptions: {
       workers: {
         wrangler: { configPath: './wrangler.jsonc' },
