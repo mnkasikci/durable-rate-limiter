@@ -1,6 +1,6 @@
 {
   "name": "@bakidev/durable-rate-limiter",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "A shared rate limiter and concurrency gate for Cloudflare Workers, backed by a Durable Object.",
   "keywords": [
     "cloudflare",
@@ -30,8 +30,7 @@
     "node": ">=18"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "bin": {
     "durable-rate-limiter": "./dist/cli.js"

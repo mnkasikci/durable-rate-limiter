@@ -102,15 +102,20 @@ npx wrangler delete --config verify/limiter/wrangler.jsonc
 
 ## 5. Publish
 
+This package is published **locally** — a manual `npm publish` from a
+maintainer's machine. There is no CI publish job.
+
 ```sh
-npm publish   # prepublishOnly reruns clean + check + build
+npm login          # once, as a maintainer of the @bakidev scope
+npm publish        # prepublishOnly reruns clean + check + build
 ```
 
-`publishConfig` sets `access: public` (the package is scoped) and
-`provenance: true`, so publishing from CI with an OIDC-enabled workflow attaches
-a provenance attestation. Publishing from a laptop requires either dropping
-provenance for that release or accepting the failure — do not silently remove
-it from `package.json`.
+`publishConfig` sets `access: public` — required because the package is scoped
+and this is its first public release. Provenance attestation is **not** used:
+it requires a CI runner with OIDC (GitHub Actions / GitLab CI), and a local
+`npm publish` with `provenance: true` fails with `EUSAGE`. The flag has been
+removed from `package.json` accordingly; do not re-add it for the local-publish
+flow.
 
 ## 6. After
 
