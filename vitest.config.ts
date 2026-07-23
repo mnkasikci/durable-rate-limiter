@@ -15,9 +15,10 @@ export default defineWorkersConfig({
         // trying to pop the storage stack. Tests take a distinct limiter name
         // each instead, which is the isolation `idFromName` already provides.
         isolatedStorage: false,
-        miniflare: {
-          compatibilityFlags: ['nodejs_compat'],
-        },
+        // No `nodejs_compat`: the package imports no Node built-ins, so an
+        // accidental `node:*` import in `src/` should fail the suite here rather
+        // than resolve silently. `cli/` is the exception and runs under its own
+        // Node config.
       },
     },
     coverage: {

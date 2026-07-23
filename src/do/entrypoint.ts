@@ -103,7 +103,11 @@ export class LimiterEntrypoint
     // `execute` as `never`, and widening it here is what stops that `never`
     // reaching consumers. No cast is needed, precisely because `never` is
     // assignable to anything — which is also why the erasure is so quiet.
-    return this.env.RATE_LIMITER.getByName(name);
+    //
+    // `get(idFromName(...))` rather than `getByName(...)`: identical behaviour,
+    // but it keeps the wrangler/workerd floor as low as the client binder and
+    // the tests, which all use this form.
+    return this.env.RATE_LIMITER.get(this.env.RATE_LIMITER.idFromName(name));
   }
 
   /** Schedule `fn` against the limiter called `name`. */

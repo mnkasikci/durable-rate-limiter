@@ -31,9 +31,11 @@
  *    is 1.2–4.9%, and compounding an uncertain number amplifies the
  *    uncertainty. At six attempts the honest range spans a factor of 5 000.
  *  - **The events are not independent.** Drops come from eviction, reset and
- *    redeploy — and a redeploy drops *every* parked caller at once, then the
- *    retries re-queue into the same window. No run has yet produced a call
- *    dropped twice, so P(second drop | first drop) is simply unmeasured.
+ *    redeploy — and a redeploy drops *every* parked caller at once. The retries
+ *    are spread by a full-jitter backoff (see `BoundLimiter.call`) so they do
+ *    not all re-queue in the same instant, but they still land in a nearby
+ *    window against a recovering object. No run has yet produced a call dropped
+ *    twice, so P(second drop | first drop) is simply unmeasured.
  *
  * What can be said: a call must now be dropped six separate times to fail, no
  * observed call was dropped more than once, and {@link DropHook} exists so an
@@ -128,7 +130,8 @@ export class NoSuchLimiterError extends Error {
       `limiter "${limiter}" does not exist: it has never been configured. ` +
         'That is usually a mistyped instance name — it is not an error to ' +
         'name a bucket nobody set up, it is simply a different bucket. ' +
-        'Configure it, or check the name against `listNames()`.',
+        'Verify the limiter was configured on the Durable Object; its ' +
+        '`listNames()` RPC lists every configured name.',
       { cause }
     );
     this.name = 'NoSuchLimiterError';
@@ -149,6 +152,8 @@ export class NoSuchLimiterError extends Error {
  * which more attempts cannot fix, while the costs stay real: every attempt
  * takes from the bucket before it runs, so a retry storm quietly spends upstream
  * quota doing nothing, and each re-queue adds another full wait to a call that
- * has already been unlucky.
+ * has already been unlucky. A full-jitter backoff between attempts (see
+ * `BoundLimiter.call`) spreads those re-queues out rather than firing them in
+ * lockstep, but it cannot make more attempts free.
  */
 export const DEFAULT_DROP_RETRIES = 5;

@@ -451,6 +451,57 @@ describe('LimiterDO.configure', () => {
       config: { concurrency: 4 },
     });
   });
+
+  // The bucket is not the only part of a config the Scheduler will reject on
+  // restore. `concurrency` and `retry` were validated nowhere until `configure`
+  // wrote them and the next `execute` built the Scheduler and threw — at request
+  // time, not deploy time. These pin that the WHOLE config is validated up
+  // front: an invalid one must reject, persist nothing, and never enter the
+  // registry.
+  it('rejects a zero concurrency and persists nothing', async () => {
+    const name = 'configure-bad-concurrency';
+    await expect(
+      limiter(name).configure(roomy({ concurrency: 0 }))
+    ).rejects.toThrow(/concurrency/);
+
+    expect(await limiter(REGISTRY_NAME).listNames()).not.toContain(name);
+    await expect(limiter(name).stats()).rejects.toThrow(/No such limiter/);
+  });
+
+  it('rejects a retry.factor below 1 and persists nothing', async () => {
+    const name = 'configure-bad-factor';
+    await expect(
+      limiter(name).configure(roomy({ retry: { factor: 0.5 } }))
+    ).rejects.toThrow(/factor/);
+
+    expect(await limiter(REGISTRY_NAME).listNames()).not.toContain(name);
+    await expect(limiter(name).stats()).rejects.toThrow(/No such limiter/);
+  });
+
+  it('rejects a negative retry.maxRetries and persists nothing', async () => {
+    const name = 'configure-bad-maxretries';
+    await expect(
+      limiter(name).configure(roomy({ retry: { maxRetries: -1 } }))
+    ).rejects.toThrow(/maxRetries/);
+
+    expect(await limiter(REGISTRY_NAME).listNames()).not.toContain(name);
+    await expect(limiter(name).stats()).rejects.toThrow(/No such limiter/);
+  });
+
+  it('refuses a reconfigure whose merged config is invalid, keeping the last good one', async () => {
+    const stub = limiter('reconfigure-invalid-scheduler');
+    await stub.configure(roomy({ concurrency: 4, retry: { maxRetries: 2 } }));
+
+    await expect(stub.reconfigure({ concurrency: 0 })).rejects.toThrow(
+      /concurrency/
+    );
+
+    // Untouched: the previous limits stay in force, exactly as a bad bucket
+    // patch already leaves them.
+    await expect(stub.stats()).resolves.toMatchObject({
+      config: { concurrency: 4, retry: { maxRetries: 2 } },
+    });
+  });
 });
 
 describe('LimiterDO.stats', () => {

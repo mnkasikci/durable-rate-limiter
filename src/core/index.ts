@@ -15,6 +15,7 @@ export {
   defaultRetryDelay,
   exponentialBackoff,
   readRetryAfterMs,
+  validateSchedulerConfig,
   DEFAULT_RETRY_OPTIONS,
   DEFAULT_CONCURRENCY,
   type Bucket,

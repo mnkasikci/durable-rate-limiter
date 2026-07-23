@@ -152,6 +152,30 @@ function requirePositive(label: string, value: number, min: number): void {
   }
 }
 
+/**
+ * Validate the concurrency and retry parts of a scheduler config the way the
+ * {@link Scheduler} constructor does — without building a scheduler, which needs
+ * a bucket the caller may not have.
+ *
+ * Extracted so a host that persists a config (see the Durable Object's
+ * `configure`/`reconfigure`) can reject an invalid one at write time rather than
+ * storing it and having every later `execute` throw when the real scheduler is
+ * finally constructed on the restore path. The constructor calls this too, so
+ * the two validations can never drift.
+ */
+export function validateSchedulerConfig(options: {
+  concurrency?: number;
+  retry?: Partial<RetryOptions>;
+}): void {
+  const retry = { ...DEFAULT_RETRY_OPTIONS, ...options.retry };
+  const concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
+  requirePositive('concurrency', concurrency, 1);
+  requirePositive('retry.maxRetries', retry.maxRetries, 0);
+  requirePositive('retry.minDelayInMs', retry.minDelayInMs, 0);
+  requirePositive('retry.maxDelayInMs', retry.maxDelayInMs, 0);
+  requirePositive('retry.factor', retry.factor, 1);
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null
     ? (value as Record<string, unknown>)
@@ -329,11 +353,15 @@ export class Scheduler<U = unknown> {
     this.#retry = { ...DEFAULT_RETRY_OPTIONS, ...options.retry };
     this.#concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
 
-    requirePositive('concurrency', this.#concurrency, 1);
-    requirePositive('retry.maxRetries', this.#retry.maxRetries, 0);
-    requirePositive('retry.minDelayInMs', this.#retry.minDelayInMs, 0);
-    requirePositive('retry.maxDelayInMs', this.#retry.maxDelayInMs, 0);
-    requirePositive('retry.factor', this.#retry.factor, 1);
+    // Shared with the host's persist-time validation, so a config the
+    // constructor would reject can never be written and then wedge every later
+    // `execute` on a restore that throws. See `validateSchedulerConfig`.
+    validateSchedulerConfig({
+      ...(options.concurrency === undefined
+        ? {}
+        : { concurrency: options.concurrency }),
+      ...(options.retry === undefined ? {} : { retry: options.retry }),
+    });
 
     this.#bucket = options.bucket;
     this.#classify = options.classify ?? createStatusClassifier<U>();

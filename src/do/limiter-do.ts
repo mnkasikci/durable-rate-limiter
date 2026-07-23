@@ -8,6 +8,7 @@ import {
   createStatusClassifier,
   defaultRetryDelay,
   readRetryAfterMs,
+  validateSchedulerConfig,
   type BucketOptions,
   type BucketState,
   type CallReport,
@@ -318,10 +319,17 @@ export class LimiterDO extends DurableObject<LimiterEnv> implements LimiterRpc {
    * which is the failure this package exists to prevent.
    */
   async configure(name: string, config: LimiterConfig): Promise<void> {
-    // Construct before persisting: an invalid bucket shape must fail the
-    // caller's `configure` rather than being written and then wedging every
-    // later `execute` on a restore that throws.
+    // Validate the WHOLE config before persisting: an invalid bucket shape, an
+    // out-of-range `concurrency`, or a bad `retry` must all fail the caller's
+    // `configure` rather than being written and then wedging every later
+    // `execute` on a restore that builds the bucket or the Scheduler and throws.
+    // `validateSchedulerConfig` is the Scheduler constructor's own check, shared
+    // so the two can never drift.
     new SlidingLogBucket(config.bucket).destroy();
+    validateSchedulerConfig({
+      concurrency: config.concurrency,
+      ...(config.retry === undefined ? {} : { retry: config.retry }),
+    });
 
     const existed =
       (await this.ctx.storage.get<LimiterConfig>(CONFIG_KEY)) !== undefined;
@@ -357,7 +365,14 @@ export class LimiterDO extends DurableObject<LimiterEnv> implements LimiterRpc {
     if (stored === undefined) throw new LimiterNotConfiguredError();
 
     const next: LimiterConfig = { ...stored, ...patch };
+    // The merged result is validated in full, for the same reason `configure`
+    // validates: a patch that produces a bad `concurrency`/`retry` must fail
+    // here, not on the next `execute`'s restore.
     new SlidingLogBucket(next.bucket).destroy();
+    validateSchedulerConfig({
+      concurrency: next.concurrency,
+      ...(next.retry === undefined ? {} : { retry: next.retry }),
+    });
 
     await this.ctx.storage.put(CONFIG_KEY, next);
     await this.#invalidate();
@@ -442,7 +457,12 @@ export class LimiterDO extends DurableObject<LimiterEnv> implements LimiterRpc {
 
   /** The reserved instance holding the name list. */
   #registry(): LimiterRpc {
-    return this.env.RATE_LIMITER.getByName(REGISTRY_NAME);
+    // `get(idFromName(...))` rather than `getByName(...)`: functionally
+    // identical, but it keeps the wrangler/workerd floor as low as the rest of
+    // the package (tests and the client binder use this same form).
+    return this.env.RATE_LIMITER.get(
+      this.env.RATE_LIMITER.idFromName(REGISTRY_NAME)
+    );
   }
 
   /**

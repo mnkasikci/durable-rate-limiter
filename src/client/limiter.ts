@@ -47,14 +47,25 @@ import {
  * limiter is typically used from many call sites; written once, exported,
  * reused.
  */
-export interface LimiterDefinition {
-  binder: Binder;
+export interface LimiterDefinition<E extends object = object> {
+  binder: Binder<E>;
   /** The instance name — `idFromName`'s argument. Selects the bucket. */
   name: string;
-  /** Default rate-limit detection for this API. */
-  rateLimit?: RateLimitHook | null;
-  /** Default error detection for this API. */
-  error?: ErrorHook | null;
+  /**
+   * Default rate-limit detection for this API. Omit it (or leave it
+   * `undefined`) when the API has no body-based rate-limit convention; the
+   * built-in HTTP 429 layer still applies.
+   *
+   * There is deliberately no `| null` here. `null` is a meaningful opt-out only
+   * at a call site, where it disables *this* default; at the definition level
+   * there is nothing below it but the unconditional HTTP layer, which no hook
+   * value can switch off — so `null` and `undefined` would be indistinguishable,
+   * and offering both is dead surface. See {@link CallOptions.rateLimit} for the
+   * slot where `null` does carry meaning.
+   */
+  rateLimit?: RateLimitHook;
+  /** Default error detection for this API. Omit it when the API has none; see {@link rateLimit} for why there is no `| null`. */
+  error?: ErrorHook;
   /**
    * Re-queue attempts after being dropped **while parked**. Defaults to
    * {@link DEFAULT_DROP_RETRIES}; `0` opts out.
@@ -129,15 +140,23 @@ export interface BoundLimiter {
   ): Promise<T>;
 }
 
-/** Inert captured configuration. Safe to hold in a module-scope `const`. */
-export interface Limiter {
+/**
+ * Inert captured configuration. Safe to hold in a module-scope `const`.
+ *
+ * Generic in the `env` type `for` accepts, carried through from the binder. A
+ * limiter built on the checked `defineBinder` is `Limiter<Env>`, so `.for(env)`
+ * demands the consumer's actual `Env` and rejects `{}` at compile time; one
+ * built on `defineBinder.unchecked` or `defineTestBinder` widens back to
+ * `object`.
+ */
+export interface Limiter<E extends object = object> {
   /** The instance name this limiter paces against. */
   readonly name: string;
   /**
    * Bind to a request's `env`. The first moment `env` exists, and therefore the
    * moment the binding's presence is checked.
    */
-  for(env: object): BoundLimiter;
+  for(env: E): BoundLimiter;
 }
 
 /**
@@ -173,7 +192,16 @@ async function buildReport<T>(
     // "Treat exactly as an HTTP 429" — said in the one vocabulary the object
     // already understands, so it needs no knowledge of this upstream.
     report.status = 429;
-    if (limit.retryAfterMs !== undefined) {
+    // Sanitise at the boundary: the object prefers `retryAfterMs` over the
+    // `Retry-After` header when computing the delay, so a hook that returns
+    // `NaN`, `Infinity`, or a negative would wedge that computation. Keep only a
+    // finite, non-negative value; anything else is dropped as if the hook had
+    // said only *that* it was rate-limited, not for how long.
+    if (
+      limit.retryAfterMs !== undefined &&
+      Number.isFinite(limit.retryAfterMs) &&
+      limit.retryAfterMs >= 0
+    ) {
       report.retryAfterMs = limit.retryAfterMs;
     }
   }
@@ -186,6 +214,41 @@ async function buildReport<T>(
   }
 
   return report;
+}
+
+/**
+ * Base of the drop-retry backoff, doubled each attempt.
+ *
+ * A drop means the object was *unreachable* — evicted, resetting, or
+ * redeploying — so the fresh stub can reject again immediately, before any
+ * bucket take slows it down. Without a wait a single caller burns all its
+ * attempts in a tight reconnect loop, and a redeploy drops every parked caller
+ * at once, so they all re-queue in the same instant: a synchronised storm
+ * against an object that is still recovering.
+ */
+const DROP_RETRY_BASE_MS = 100;
+/** Ceiling for the (pre-jitter) drop-retry backoff, so it never runs away. */
+const DROP_RETRY_CAP_MS = 2_000;
+
+/**
+ * Full-jitter exponential backoff between drop retries: a uniform pick from
+ * `[0, min(base * 2 ** (attempt - 1), cap)]`.
+ *
+ * `attempt` is the 1-based index of the attempt that was just dropped. Full
+ * jitter (rather than a fixed or equal-jitter delay) is what de-synchronises a
+ * fleet of callers dropped together by one redeploy — each waits a different,
+ * unpredictable slice, so they do not re-queue in lockstep.
+ */
+function dropRetryDelayMs(attempt: number): number {
+  const ceiling = Math.min(
+    DROP_RETRY_BASE_MS * 2 ** (attempt - 1),
+    DROP_RETRY_CAP_MS
+  );
+  return Math.random() * ceiling;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -206,10 +269,12 @@ async function buildReport<T>(
  * });
  * ```
  */
-export function defineLimiter(definition: LimiterDefinition): Limiter {
+export function defineLimiter<E extends object = object>(
+  definition: LimiterDefinition<E>
+): Limiter<E> {
   return {
     name: definition.name,
-    for(env: object): BoundLimiter {
+    for(env: E): BoundLimiter {
       // Resolved once per request rather than per call: the presence check is
       // the point of this step, and a caller making ten calls should hear
       // about a mistyped binding once, before any of them run.
@@ -285,12 +350,26 @@ export function defineLimiter(definition: LimiterDefinition): Limiter {
               // Reported before the retry, not after: a hook that only fires
               // on the final failure cannot measure a drop rate, which is the
               // number an operator actually needs.
-              definition.onDrop?.({
-                limiter: definition.name,
-                attempt,
-                willRetry,
-                error: cause,
-              });
+              //
+              // Guarded: `onDrop` is observability, and observability must never
+              // change the outcome. An unguarded throw here (a metrics client
+              // choking on a circular ref while serialising `cause`, say) would
+              // propagate out of `call`, skip every remaining drop-retry, and
+              // hand the caller the hook's error instead of a retried success or
+              // a `CallDroppedError`. Contained to a `console.warn`.
+              try {
+                definition.onDrop?.({
+                  limiter: definition.name,
+                  attempt,
+                  willRetry,
+                  error: cause,
+                });
+              } catch (hookError) {
+                console.warn(
+                  'durable-rate-limiter: onDrop hook threw',
+                  hookError
+                );
+              }
 
               if (!willRetry) {
                 throw new CallDroppedError(definition.name, attempt, cause);
@@ -302,8 +381,13 @@ export function defineLimiter(definition: LimiterDefinition): Limiter {
               // the shared one rather than a local means the next call does
               // not have to rediscover the breakage for itself.
               stub = definition.binder.stubFor(env, definition.name);
-              // No backoff: the retry must take from the bucket again before it
-              // can run, so the bucket's own pacing is already the wait.
+
+              // Back off before re-queuing, with full jitter. A drop is the
+              // object being unreachable, not the bucket being full, so nothing
+              // else paces this retry — without a wait one caller reconnect-loops
+              // through its whole budget, and a redeploy's worth of parked
+              // callers all storm back at once. See {@link dropRetryDelayMs}.
+              await sleep(dropRetryDelayMs(attempt));
             }
           }
         },

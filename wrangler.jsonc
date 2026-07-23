@@ -8,7 +8,9 @@
   "name": "durable-rate-limiter-dev",
   "main": "src/do/index.ts",
   "compatibility_date": "2025-07-01",
-  "compatibility_flags": ["nodejs_compat"],
+  // No `nodejs_compat`: nothing in `src/` imports a Node built-in, and leaving
+  // the flag off means an accidental `node:*` import in shippable code fails
+  // the build and the test suite instead of silently resolving.
   "durable_objects": {
     "bindings": [
       {

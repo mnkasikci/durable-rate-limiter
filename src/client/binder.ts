@@ -82,8 +82,16 @@ export interface NamespaceLike<Id = unknown> {
   get(id: Id): unknown;
 }
 
-/** Inert captured configuration. Reused across every limiter in an app. */
-export interface Binder {
+/**
+ * Inert captured configuration. Reused across every limiter in an app.
+ *
+ * Generic in the `env` type it accepts. `defineBinder` returns `Binder<Env>`,
+ * so the `env` a limiter is later bound to is checked against the consumer's
+ * generated bindings rather than accepted as a bare `object` — passing `{}` no
+ * longer compiles. `defineBinder.unchecked` and `defineTestBinder` widen back to
+ * `object`, which is what makes `.for({})` legal in a test with no real `env`.
+ */
+export interface Binder<E extends object = object> {
   /**
    * The key looked up on `env`, or `null` for a binder that was handed a
    * namespace directly and never looks at `env` at all.
@@ -93,7 +101,7 @@ export interface Binder {
    * Resolve a stub for one named limiter instance. Called from `.for(env)`,
    * never at module scope.
    */
-  stubFor(env: object, instanceName: string): LimiterStub;
+  stubFor(env: E, instanceName: string): LimiterStub;
 }
 
 function isNamespaceLike(value: unknown): value is NamespaceLike {
@@ -150,7 +158,7 @@ function resolveNamespace(env: object, bindingName: string): NamespaceLike {
   return value;
 }
 
-function binderForName(bindingName: string): Binder {
+function binderForName(bindingName: string): Binder<Env> {
   return {
     bindingName,
     stubFor: (env, instanceName) =>
@@ -171,7 +179,7 @@ function binderForName(bindingName: string): Binder {
  */
 export function defineBinder(
   bindingName: Extract<DoBindings<Env>, string>
-): Binder {
+): Binder<Env> {
   return binderForName(bindingName);
 }
 

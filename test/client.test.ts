@@ -1,9 +1,10 @@
 import { env } from 'cloudflare:test';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   CallDroppedError,
   DEFAULT_DROP_RETRIES,
+  NoSuchLimiterError,
   defineBinder,
   defineLimiter,
   defineTestBinder,
@@ -702,6 +703,112 @@ describe('call — the drop test is per call, not per binding', () => {
     expect(execCount).toBe(3);
   });
 
+  it('contains a throwing onDrop so it cannot alter the outcome', async () => {
+    // The hook is observability, and observability must never change the
+    // result. An unguarded throw here would propagate out of `call`, skip the
+    // remaining drop-retries, and hand the caller the hook's error instead of
+    // the retried success. Guarded, the call still recovers.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const { binder, attempts } = droppingBinder(2);
+      let ran = 0;
+
+      const value = await defineLimiter({
+        binder,
+        name: 'throwing-hook',
+        onDrop: () => {
+          throw new Error('metrics client exploded');
+        },
+      })
+        .for({})
+        .call(
+          () => {
+            ran += 1;
+            return respond(200);
+          },
+          { read: () => 'ok' }
+        );
+
+      expect(value).toBe('ok');
+      expect(attempts()).toBe(3);
+      expect(ran).toBe(1);
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('still fails with CallDroppedError when a throwing onDrop cannot save the call', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const { binder, attempts } = droppingBinder(Infinity);
+
+      await expect(
+        defineLimiter({
+          binder,
+          name: 'throwing-hook-spent',
+          dropRetries: 1,
+          onDrop: () => {
+            throw new Error('boom');
+          },
+        })
+          .for({})
+          .call(() => respond(200), { read: () => 'ok' })
+      ).rejects.toThrow(CallDroppedError);
+
+      // The hook threw on both drops, yet the retry budget was still spent in
+      // full rather than short-circuited by the hook's error.
+      expect(attempts()).toBe(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('waits a full-jitter backoff between drop retries', async () => {
+    // A drop is the object being unreachable, not the bucket being full, so
+    // nothing else paces the retry. With `Math.random` pinned to 1 the delay is
+    // the full (pre-jitter) ceiling: 100, 200, 400 ms across three retries.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(1);
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      const { binder, attempts } = droppingBinder(Infinity);
+
+      await defineLimiter({ binder, name: 'backoff', dropRetries: 3 })
+        .for({})
+        .call(() => respond(200), { read: () => 'ok' })
+        .catch(() => undefined);
+
+      const delays = setTimeoutSpy.mock.calls.map((call) => call[1]);
+      expect(attempts()).toBe(4);
+      expect(delays).toEqual([100, 200, 400]);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      random.mockRestore();
+    }
+  });
+
+  it('keeps the jittered backoff within [0, ceiling]', async () => {
+    // Full jitter: with `Math.random` at 0 the wait floors to 0, and at 1 it is
+    // the ceiling — so every real delay lands in between.
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    try {
+      const { binder } = droppingBinder(Infinity);
+
+      await defineLimiter({ binder, name: 'backoff-floor', dropRetries: 3 })
+        .for({})
+        .call(() => respond(200), { read: () => 'ok' })
+        .catch(() => undefined);
+
+      expect(setTimeoutSpy.mock.calls.map((call) => call[1])).toEqual([
+        0, 0, 0,
+      ]);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      random.mockRestore();
+    }
+  });
+
   it('keeps the flag per attempt, so a later attempt cannot inherit an earlier one', async () => {
     // Same hazard one level down: two attempts of the SAME call. If the flag
     // outlived an attempt, a first attempt that ran and failed would make a
@@ -733,5 +840,94 @@ describe('call — the drop test is per call, not per binding', () => {
     expect(value).toBe('ok');
     expect(ran).toBe(1);
     expect(execCount).toBe(3);
+  });
+});
+
+describe('call — a hook-supplied retryAfterMs is sanitised', () => {
+  // The object prefers `retryAfterMs` over the `Retry-After` header when
+  // computing its delay, so a hook returning something non-finite or negative
+  // would wedge that computation. Anything not finite-and-non-negative is
+  // dropped, as if the hook had signalled only *that* it was rate-limited.
+  it.each([NaN, -5, Infinity, -Infinity])(
+    'drops a non-finite or negative retryAfterMs (%s)',
+    async (bad) => {
+      const { binder, reports } = capturingBinder();
+
+      await defineLimiter({
+        binder,
+        name: 'sanitise',
+        rateLimit: () => ({ retryAfterMs: bad }),
+      })
+        .for({})
+        .call(() => respond(200), { read: () => 'x' });
+
+      // Still a rate limit — just one with no stated delay.
+      expect(reports[0]?.status).toBe(429);
+      expect(reports[0]?.retryAfterMs).toBeUndefined();
+    }
+  );
+
+  it('keeps a finite, non-negative retryAfterMs, including 0', async () => {
+    const { binder, reports } = capturingBinder();
+
+    await defineLimiter({
+      binder,
+      name: 'sanitise-ok',
+      rateLimit: () => ({ retryAfterMs: 0 }),
+    })
+      .for({})
+      .call(() => respond(200), { read: () => 'x' });
+
+    expect(reports[0]?.status).toBe(429);
+    expect(reports[0]?.retryAfterMs).toBe(0);
+  });
+});
+
+describe('typing — for(env) and definition-level hooks', () => {
+  it('rejects a bare or wrong-shaped env for a checked binder at compile time', () => {
+    const bound = defineLimiter({
+      binder: defineBinder('RATE_LIMITER'),
+      name: uniqueName('typed'),
+    });
+
+    // @ts-expect-error {} is not the generated Env a checked binder demands.
+    expect(() => bound.for({})).toThrow(/not found on env/);
+    // @ts-expect-error a wrong-shaped env is rejected the same way.
+    expect(() => bound.for({ NOPE: 1 })).toThrow(/not found on env/);
+  });
+
+  it('rejects a definition-level null hook at compile time', () => {
+    // `null` is a meaningful opt-out only at a call site; at the definition
+    // level it was indistinguishable from `undefined`, so the dead `| null` is
+    // gone. These pin that it no longer typechecks (the runtime just captures
+    // config, so nothing throws).
+    expect(() =>
+      defineLimiter({
+        binder: capturingBinder().binder,
+        name: 'no-null-rate-limit',
+        // @ts-expect-error definition-level rateLimit no longer accepts null.
+        rateLimit: null,
+      })
+    ).not.toThrow();
+
+    expect(() =>
+      defineLimiter({
+        binder: capturingBinder().binder,
+        name: 'no-null-error',
+        // @ts-expect-error definition-level error no longer accepts null.
+        error: null,
+      })
+    ).not.toThrow();
+  });
+});
+
+describe('NoSuchLimiterError', () => {
+  it('points at the Durable Object listNames() RPC, not a client method', () => {
+    // The old message told the consumer to "check the name against
+    // `listNames()`", an API the client never exposes. It now describes where
+    // that RPC actually lives.
+    const error = new NoSuchLimiterError('typo', new Error('cause'));
+    expect(error.message).toMatch(/Durable Object/);
+    expect(error.message).toMatch(/listNames\(\)/);
   });
 });
