@@ -12,7 +12,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # Node 24 ships npm 11, the major that generates package-lock.json here.
+          # npm 10 resolves wrangler's optional `@cloudflare/workers-types` peer
+          # differently and rejects the lockfile as out of sync.
+          node-version: 24
           cache: npm
       - run: npm ci
       - run: npm run check
