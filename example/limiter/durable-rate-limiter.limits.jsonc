@@ -1,0 +1,34 @@
+// The limits. NOT read at runtime — this file is never deployed, and the
+// limiter Worker never imports it.
+//
+//   1. edit a limit here
+//   2. POST it to the limiter's /configure route (see example/README.md)
+//
+// No redeploy in between. The limits live in the Durable Object's own storage,
+// and `configure` writes them there over the key-guarded route.
+//
+// limitPerWindow is the upstream limit, verbatim. A rested caller may spend the
+// whole of it at once — "10 per minute" is limitPerWindow 10, windowInMs
+// 60000 — and no rolling window ever holds more than limitPerWindow: the pacing
+// is a sliding log, so the allowance is bounded continuously.
+//
+// One entry per upstream LIMIT, not per app. Both apps name this one bucket, so
+// both share this one allowance — which is the entire point of the demo.
+{
+  "limits": {
+    // The upstream (drl-example-upstream) enforces 12 requests / 60s across the
+    // whole API. This is set to 10, deliberately UNDER 12, so the demo starts
+    // clean: the shared bucket paces both apps below the real ceiling and no
+    // real 429s appear until you provoke them. Raise this past 12 from the
+    // dashboard and the apps will overrun the upstream, earn a real 429, and
+    // you can watch that one 429 pause BOTH apps — the shared penalty.
+    "demo-upstream-api": {
+      "bucket": {
+        "limitPerWindow": 10,
+        "windowInMs": 60000,
+      },
+      "concurrency": 3,
+      "retry": { "maxRetries": 3, "maxDelayInMs": 30000 },
+    },
+  },
+}

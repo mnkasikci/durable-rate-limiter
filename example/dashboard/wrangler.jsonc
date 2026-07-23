@@ -1,0 +1,35 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "drl-example-dashboard",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-07-01",
+  "observability": { "enabled": true },
+
+  // This Worker is designed to run LOCALLY with `wrangler dev`, not deployed
+  // (though the same code would deploy fine). It holds no state; it only serves
+  // the page and proxies to the four deployed Workers.
+  //
+  // "remote": true is the whole trick. Under `wrangler dev` it connects each
+  // binding to the DEPLOYED Worker instead of expecting a local one, so the page
+  // develops against real limiter/upstream/app state. Because Workers 1–4 are
+  // always deployed, there is no local Durable Object to emulate — the reason
+  // this hybrid works at all. Deploys ignore the flag.
+  "services": [
+    {
+      "binding": "LIMITER_SVC",
+      "service": "drl-example-limiter",
+      "remote": true,
+    },
+    {
+      "binding": "UPSTREAM_SVC",
+      "service": "drl-example-upstream",
+      "remote": true,
+    },
+    { "binding": "ALPHA_SVC", "service": "drl-example-alpha", "remote": true },
+    { "binding": "BRAVO_SVC", "service": "drl-example-bravo", "remote": true },
+  ],
+
+  // DRL_CONFIG_KEY is a SECRET, not a var — it is only ever used server-side and
+  // never reaches the browser. For local dev, put it in `.dev.vars` (which never
+  // deploys and is gitignored). Use the SAME value as the limiter's secret.
+}

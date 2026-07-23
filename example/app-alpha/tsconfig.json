@@ -1,0 +1,18 @@
+{
+  // One tsconfig project per Worker, on purpose: each declares its own global
+  // `Env` with its own concrete bindings, and separate projects keep those
+  // declarations from merging into one blob where a binding from one Worker
+  // would silently satisfy another's env. app-alpha and app-bravo declare the
+  // identical `Env` shape and only stay distinct because of this split.
+  //
+  // Extends the root config verify-style; imports from `dist/`, typecheck only.
+  // Run with: npm run example:typecheck  (after npm run build)
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types"],
+    "noEmit": true,
+    "declaration": false,
+    "emitDeclarationOnly": false
+  },
+  "include": ["src", "../shared"]
+}

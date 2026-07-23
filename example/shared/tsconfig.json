@@ -1,0 +1,13 @@
+{
+  // `shared/` has no Worker of its own — each Worker's tsconfig pulls it in via
+  // `../shared`. This project exists only so the type-aware linter has a
+  // tsconfig to associate `protocol.ts` with; `example:typecheck` never
+  // references it. protocol.ts uses no Workers globals, so it needs no `types`.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "emitDeclarationOnly": false
+  },
+  "include": ["."]
+}

@@ -1,0 +1,52 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "drl-example-alpha",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-07-01",
+  "observability": { "enabled": true },
+
+  // Binds the shared limiter Worker's NAMED RPC entrypoint. "entrypoint" is
+  // required: a service binding without it resolves to the default export
+  // instead, and the limiter's entrypoint is a NAMED export, so it would fail
+  // at startup with "has no such named entrypoint".
+  "services": [
+    {
+      "binding": "LIMITER",
+      "service": "drl-example-limiter",
+      "entrypoint": "LimiterEntrypoint",
+    },
+    {
+      // HTTP hop to the upstream. A plain fetch() of another Worker's
+      // workers.dev URL is blocked (Cloudflare error 1042), so the request is
+      // dispatched over this binding; UPSTREAM_URL still names the origin.
+      "binding": "UPSTREAM",
+      "service": "drl-example-upstream",
+    },
+  ],
+
+  // This app's own request-state tracker. A single instance records every
+  // request's current state, so a dashboard poll (which may hit a different
+  // isolate than the burst) reads a truthful tally rather than an in-memory zero.
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "STATUS",
+        "class_name": "StatusDO",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["StatusDO"],
+    },
+  ],
+
+  "vars": {
+    // The origin of drl-example-upstream, the mock API this app calls. The
+    // request travels over the UPSTREAM binding; this var only names the origin
+    // the URL is built against. Fill in your own workers.dev subdomain — the
+    // upstream's first deploy prints the full URL.
+    "UPSTREAM_URL": "https://drl-example-upstream.<fillherefordeployingexampleapp>.workers.dev",
+  },
+}

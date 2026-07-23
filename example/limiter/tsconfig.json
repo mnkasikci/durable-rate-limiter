@@ -1,0 +1,15 @@
+{
+  // Extends the root config verify-style. The demo is deployed, not published:
+  // it imports from `dist/`, which the root config emits, and a project cannot
+  // both emit a directory and typecheck against it — so this one only checks.
+  //
+  // Run with: npm run example:typecheck  (after npm run build)
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types"],
+    "noEmit": true,
+    "declaration": false,
+    "emitDeclarationOnly": false
+  },
+  "include": ["src", "../shared"]
+}

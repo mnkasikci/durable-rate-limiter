@@ -3,7 +3,9 @@ import prettier from 'eslint-config-prettier';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'coverage/**', 'node_modules/**'] },
+  // `**/.wrangler/**` covers the transient bundles `wrangler dev` writes into
+  // each example/ sub-project — generated code that must not gate a lint run.
+  { ignores: ['dist/**', 'coverage/**', 'node_modules/**', '**/.wrangler/**'] },
   js.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,

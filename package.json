@@ -69,6 +69,7 @@
     "coverage": "vitest run --coverage",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run coverage && npm run test:cli",
     "verify:typecheck": "tsc -p verify/tsconfig.json",
+    "example:typecheck": "tsc -p example/limiter/tsconfig.json && tsc -p example/upstream/tsconfig.json && tsc -p example/app-alpha/tsconfig.json && tsc -p example/app-bravo/tsconfig.json && tsc -p example/dashboard/tsconfig.json",
     "prepublishOnly": "npm run clean && npm run check && npm run build"
   },
   "devDependencies": {

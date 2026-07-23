@@ -1,0 +1,26 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "drl-example-upstream",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-07-01",
+  "observability": { "enabled": true },
+
+  // One Durable Object, a single instance. It holds the rolling-window arrival
+  // state that enforces the mock API's own limit, plus two counters. A DO, not
+  // KV: the window needs strict ordering and read-your-writes so two
+  // near-simultaneous /api calls cannot both slip past a one-slot ceiling.
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MOCK",
+        "class_name": "MockApiDO",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MockApiDO"],
+    },
+  ],
+}
